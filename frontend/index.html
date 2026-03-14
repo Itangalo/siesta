@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="sv">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Siesta</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="page">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">Siesta</p>
+          <h1>Spela patiensen och jämför dina drag med agenten.</h1>
+          <p class="subtitle">
+            Alla kort är öppna. Klicka eller dra ett kort i en flyttbar toppsekvens för att välja hur lång sekvens du vill flytta.
+          </p>
+        </div>
+        <div class="toolbar">
+          <button id="new-game">Nytt parti</button>
+          <button id="deal">Dela kort</button>
+          <button id="undo">Ångra</button>
+          <button id="suggest">AI-förslag</button>
+          <button id="concede" class="danger">Ge upp</button>
+        </div>
+      </header>
+
+      <section class="status-panel">
+        <div>
+          <span class="label">Status</span>
+          <strong id="status-text">Laddar...</strong>
+        </div>
+        <div>
+          <span class="label">Talong</span>
+          <strong id="stock-count">0</strong>
+        </div>
+        <div>
+          <span class="label">Kompletta sekvenser</span>
+          <strong id="sequence-count">0</strong>
+        </div>
+        <div>
+          <span class="label">Drag</span>
+          <strong id="move-count">0</strong>
+        </div>
+      </section>
+
+      <section class="selection-panel">
+        <div id="selection-text">Ingen flytt vald.</div>
+        <div id="ai-summary" class="ai-summary">Ladda AI-förslag för att se hur agenten resonerar.</div>
+        <div id="feedback-panel" class="feedback-panel hidden">
+          <div id="feedback-text"></div>
+          <button id="save-feedback" type="button">Spara korrigering</button>
+        </div>
+        <div id="feedback-status" class="feedback-status"></div>
+        <div id="suggestions" class="suggestions empty">Inga AI-förslag laddade.</div>
+      </section>
+
+      <main>
+        <section id="board" class="board"></section>
+      </main>
+    </div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
