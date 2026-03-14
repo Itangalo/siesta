@@ -1,3 +1,5 @@
+import json
+
 from backend.siesta.game import Card, GameState
 from backend.siesta.training import (
     benchmark_policies,
@@ -5,6 +7,7 @@ from backend.siesta.training import (
     build_training_examples,
     choose_search_action,
     evaluate_policy,
+    load_human_feedback_cases,
     rank_actions_for_state,
 )
 
@@ -125,3 +128,48 @@ def test_ui_ranking_returns_compact_suggestions():
     assert len(ranking["suggestions"]) <= 5
     assert ranking["suggestions"]
     assert all("description" in suggestion for suggestion in ranking["suggestions"])
+
+
+def test_load_human_feedback_cases_uses_strongest_duplicate(tmp_path):
+    state_snapshot = {
+        "status": "in_progress",
+        "terminal_reason": None,
+        "moves_played": 0,
+        "stock_count": 0,
+        "completed_sequences": 0,
+        "state_hash": "demo",
+        "columns": [
+            {"index": 0, "cards": [{"rank": 6, "suit": "hearts"}], "movable_run_length": 1, "height": 1},
+            {"index": 1, "cards": [{"rank": 7, "suit": "spades"}], "movable_run_length": 1, "height": 1},
+            {"index": 2, "cards": [], "movable_run_length": 0, "height": 0},
+            {"index": 3, "cards": [], "movable_run_length": 0, "height": 0},
+            {"index": 4, "cards": [], "movable_run_length": 0, "height": 0},
+            {"index": 5, "cards": [], "movable_run_length": 0, "height": 0},
+            {"index": 6, "cards": [], "movable_run_length": 0, "height": 0},
+        ],
+        "stock_cards": [],
+    }
+    rows = [
+        {
+            "timestamp": "2026-03-14T10:00:00+00:00",
+            "state_hash": "demo",
+            "feedback_strength": "normal",
+            "chosen_action": {"type": "move", "from_column": 0, "to_column": 1, "run_length": 1},
+            "state_snapshot": state_snapshot,
+        },
+        {
+            "timestamp": "2026-03-14T10:00:01+00:00",
+            "state_hash": "demo",
+            "feedback_strength": "important",
+            "chosen_action": {"type": "move", "from_column": 0, "to_column": 1, "run_length": 1},
+            "state_snapshot": state_snapshot,
+        },
+    ]
+    path = tmp_path / "human_feedback.jsonl"
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    cases, summary = load_human_feedback_cases(path=path)
+    assert len(cases) == 1
+    assert summary.records_seen == 2
+    assert summary.unique_entries == 1
+    assert cases[0].weight >= 7.0

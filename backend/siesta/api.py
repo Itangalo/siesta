@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .game import (
+    Card,
     GameState,
     InvalidMoveError,
     Move,
@@ -33,6 +34,7 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 FRONTEND_DIR = ROOT_DIR / "frontend"
 DATA_DIR = ROOT_DIR / "backend" / "data"
 FEEDBACK_LOG_PATH = DATA_DIR / "human_feedback.jsonl"
+SESSIONS_DIR = DATA_DIR / "sessions"
 
 
 @dataclass
@@ -46,23 +48,49 @@ class GameSession:
 
 
 class SessionStore:
-    def __init__(self) -> None:
+    def __init__(self, storage_dir: Path = SESSIONS_DIR) -> None:
         self._games: Dict[str, GameSession] = {}
+        self._storage_dir = storage_dir
+        self._storage_dir.mkdir(parents=True, exist_ok=True)
+
+    def _session_path(self, game_id: str) -> Path:
+        return self._storage_dir / f"{game_id}.json"
+
+    def _save(self, session: GameSession) -> None:
+        payload = {
+            "game_id": session.game_id,
+            "history": [_serialize_game_state(state) for state in session.history],
+        }
+        self._session_path(session.game_id).write_text(json.dumps(payload), encoding="utf-8")
+
+    def _load(self, game_id: str) -> GameSession:
+        path = self._session_path(game_id)
+        if not path.exists():
+            raise KeyError(game_id)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        session = GameSession(
+            game_id=payload["game_id"],
+            history=[_deserialize_game_state(state_data) for state_data in payload["history"]],
+        )
+        self._games[game_id] = session
+        return session
 
     def create(self, seed: Optional[int] = None) -> GameSession:
         game_id = uuid.uuid4().hex[:12]
         session = GameSession(game_id=game_id, history=[create_game(seed=seed)])
         self._games[game_id] = session
+        self._save(session)
         return session
 
     def get(self, game_id: str) -> GameSession:
         if game_id not in self._games:
-            raise KeyError(game_id)
+            return self._load(game_id)
         return self._games[game_id]
 
     def push(self, game_id: str, state: GameState) -> GameSession:
         session = self.get(game_id)
         session.history.append(state)
+        self._save(session)
         return session
 
     def undo(self, game_id: str) -> GameSession:
@@ -70,6 +98,7 @@ class SessionStore:
         if len(session.history) <= 1:
             raise InvalidMoveError("No earlier state available.")
         session.history.pop()
+        self._save(session)
         return session
 
 
@@ -137,11 +166,57 @@ def _serialize_session(session: GameSession) -> Dict[str, Any]:
     return serialize_state(session.state, game_id=session.game_id, history_depth=len(session.history) - 1)
 
 
+def _serialize_game_state(state: GameState) -> Dict[str, Any]:
+    return {
+        "columns": [[card.to_dict() for card in column] for column in state.columns],
+        "stock": [card.to_dict() for card in state.stock],
+        "status": state.status,
+        "moves_played": state.moves_played,
+        "terminal_reason": state.terminal_reason,
+        "state_hash": state.state_hash,
+        "completed_sequences": state.completed_sequences,
+    }
+
+
+def _deserialize_card(payload: Dict[str, Any]) -> Card:
+    return Card(rank=int(payload["rank"]), suit=str(payload["suit"]))
+
+
+def _deserialize_game_state(payload: Dict[str, Any]) -> GameState:
+    return GameState(
+        columns=[[_deserialize_card(card) for card in column] for column in payload["columns"]],
+        stock=[_deserialize_card(card) for card in payload["stock"]],
+        status=str(payload["status"]),
+        moves_played=int(payload["moves_played"]),
+        terminal_reason=payload.get("terminal_reason"),
+        state_hash=str(payload.get("state_hash", "")),
+        completed_sequences=int(payload.get("completed_sequences", 0)),
+    )
+
+
 def _get_session(game_id: str) -> GameSession:
     try:
         return store.get(game_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Unknown game_id.") from exc
+
+
+def _card_dict(card: Card) -> Dict[str, Any]:
+    return card.to_dict()
+
+
+def _snapshot_with_stock(state: GameState, game_id: str, history_depth: int) -> Dict[str, Any]:
+    snapshot = serialize_state(state, game_id=game_id, history_depth=history_depth)
+    snapshot["stock_cards"] = [_card_dict(card) for card in state.stock]
+    return snapshot
+
+
+def _find_state_by_hash(session: GameSession, state_hash: str) -> Optional[tuple[int, GameState]]:
+    for index in range(len(session.history) - 1, -1, -1):
+        candidate = session.history[index]
+        if candidate.state_hash == state_hash:
+            return index, candidate
+    return None
 
 
 def _apply_state(game_id: str, state: GameState) -> Dict[str, Any]:
@@ -235,7 +310,13 @@ def evaluate_move(request: GameActionRequest) -> Dict[str, Any]:
 
 @app.post("/ai/feedback")
 def save_feedback(request: FeedbackRequest) -> Dict[str, Any]:
-    _get_session(request.game_id)
+    session = _get_session(request.game_id)
+    matched_state = _find_state_by_hash(session, request.state_hash)
+    if matched_state is None:
+        authoritative_snapshot = request.state_snapshot
+    else:
+        history_index, history_state = matched_state
+        authoritative_snapshot = _snapshot_with_stock(history_state, request.game_id, history_index)
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     record = {
@@ -250,7 +331,7 @@ def save_feedback(request: FeedbackRequest) -> Dict[str, Any]:
         "recommended_action": request.recommended_action,
         "chosen_action": request.chosen_action,
         "candidate_actions": request.candidate_actions,
-        "state_snapshot": request.state_snapshot,
+        "state_snapshot": authoritative_snapshot,
         "note": request.note,
     }
     with feedback_lock:

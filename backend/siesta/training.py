@@ -9,12 +9,14 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from .game import (
+    Card,
     GameState,
     Move,
     STATUS_IN_PROGRESS,
     apply_deal,
     apply_move,
     can_deal,
+    create_deck,
     create_game,
     legal_moves,
     serialize_state,
@@ -25,8 +27,10 @@ from .game import (
 
 MODELS_DIR = Path(__file__).resolve().parents[1] / "models"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 DEFAULT_MODEL_PATH = MODELS_DIR / "policy-latest.npz"
 DEFAULT_METADATA_PATH = MODELS_DIR / "policy-latest.json"
+DEFAULT_FEEDBACK_PATH = DATA_DIR / "human_feedback.jsonl"
 DEFAULT_SEARCH_DEPTH = 2
 DEFAULT_SEARCH_BEAM_WIDTH = 4
 DEFAULT_SEARCH_DISCOUNT = 0.92
@@ -72,6 +76,16 @@ class TrainingCase:
     chosen_signature: str
     action_signatures: List[str]
     soft_targets: np.ndarray
+
+
+@dataclass
+class HumanFeedbackSummary:
+    records_seen: int = 0
+    unique_entries: int = 0
+    cases_loaded: int = 0
+    skipped_missing_state: int = 0
+    skipped_missing_action: int = 0
+    inferred_stock_cases: int = 0
 
 
 def emit_progress(progress: ProgressCallback, message: str) -> None:
@@ -220,6 +234,20 @@ def choose_random_action(state: GameState, rng: Optional[random.Random] = None) 
 
 def action_signature(state: GameState, action: Action) -> str:
     return action.to_dict(state)["description"]
+
+
+def action_payload_matches(action: Action, payload: Dict[str, Any]) -> bool:
+    if action.type != payload.get("type"):
+        return False
+    if action.type == "deal":
+        return True
+    if action.type != "move" or action.move is None:
+        return False
+    return (
+        action.move.from_column == payload.get("from_column")
+        and action.move.to_column == payload.get("to_column")
+        and action.move.run_length == payload.get("run_length")
+    )
 
 
 def _rollout_tail_value(
@@ -760,8 +788,14 @@ def train_policy_model(
     progress: ProgressCallback = None,
 ) -> Dict[str, Any]:
     cases = build_training_cases(num_games=num_games, teacher_policy=teacher_policy, progress=progress)
+    human_cases, human_feedback_summary = load_human_feedback_cases(progress=progress)
+    cases.extend(human_cases)
     model = NumpyPolicyNetwork(input_dim=cases[0].features.shape[1], hidden_dim=hidden_dim)
-    emit_progress(progress, f"[train] starting ranked training on {len(cases)} decision states")
+    emit_progress(
+        progress,
+        f"[train] starting ranked training on {len(cases)} decision states "
+        f"({len(human_cases)} human, {len(cases) - len(human_cases)} generated)",
+    )
     metrics = model.train_ranked(cases, epochs=epochs, learning_rate=learning_rate, progress=progress)
     model.save(DEFAULT_MODEL_PATH)
     emit_progress(progress, "[benchmark] evaluating heuristic")
@@ -791,6 +825,11 @@ def train_policy_model(
         "teacher_policy": teacher_policy,
         "benchmark_games": benchmark_games,
         "training_cases": len(cases),
+        "generated_training_cases": len(cases) - len(human_cases),
+        "human_feedback_cases": len(human_cases),
+        "human_feedback_records_seen": human_feedback_summary.records_seen,
+        "human_feedback_unique_entries": human_feedback_summary.unique_entries,
+        "human_feedback_inferred_stock_cases": human_feedback_summary.inferred_stock_cases,
         "teacher_search_depth": DEFAULT_TEACHER_SEARCH_DEPTH,
         "teacher_search_beam_width": DEFAULT_TEACHER_SEARCH_BEAM_WIDTH,
         "teacher_search_rollout_steps": DEFAULT_TEACHER_SEARCH_ROLLOUT_STEPS,
@@ -1135,6 +1174,142 @@ def teacher_soft_targets(
     exp_scores = np.exp(np.clip(shifted, -30.0, 30.0))
     probs = exp_scores / np.sum(exp_scores)
     return probs.astype(np.float32)
+
+
+def _make_card(card_data: Dict[str, Any]) -> Card:
+    return Card(rank=int(card_data["rank"]), suit=str(card_data["suit"]))
+
+
+def reconstruct_feedback_state(snapshot: Dict[str, Any]) -> Tuple[GameState, bool]:
+    columns = [[_make_card(card) for card in column["cards"]] for column in snapshot["columns"]]
+    stock_cards = snapshot.get("stock_cards")
+    if stock_cards is not None:
+        stock = [_make_card(card) for card in stock_cards]
+        exact_stock = True
+    else:
+        dealt_codes = {card.code for column in columns for card in column}
+        remaining_cards = [card for card in create_deck() if card.code not in dealt_codes]
+        stock_count = int(snapshot.get("stock_count", len(remaining_cards)))
+        stock = remaining_cards[:stock_count]
+        exact_stock = False
+    state = GameState(
+        columns=columns,
+        stock=stock,
+        status=str(snapshot.get("status", STATUS_IN_PROGRESS)),
+        moves_played=int(snapshot.get("moves_played", 0)),
+        terminal_reason=snapshot.get("terminal_reason"),
+    )
+    return state, exact_stock
+
+
+def _feedback_strength_weight(strength: str) -> float:
+    weights = {
+        "normal": 4.0,
+        "important": 7.0,
+        "key_move": 11.0,
+    }
+    return weights.get(strength, 4.0)
+
+
+def _dedupe_feedback_records(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    strength_rank = {"normal": 0, "important": 1, "key_move": 2}
+    deduped: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for record in records:
+        state_hash = str(record.get("state_hash", ""))
+        chosen_action = record.get("chosen_action", {})
+        dedupe_key = (
+            state_hash,
+            json.dumps(
+                {
+                    "type": chosen_action.get("type"),
+                    "from_column": chosen_action.get("from_column"),
+                    "to_column": chosen_action.get("to_column"),
+                    "run_length": chosen_action.get("run_length"),
+                    "description": chosen_action.get("description"),
+                },
+                sort_keys=True,
+            ),
+        )
+        current = deduped.get(dedupe_key)
+        if current is None:
+            deduped[dedupe_key] = record
+            continue
+        current_rank = strength_rank.get(str(current.get("feedback_strength", "normal")), 0)
+        next_rank = strength_rank.get(str(record.get("feedback_strength", "normal")), 0)
+        current_ts = str(current.get("timestamp", ""))
+        next_ts = str(record.get("timestamp", ""))
+        if next_rank > current_rank or (next_rank == current_rank and next_ts > current_ts):
+            deduped[dedupe_key] = record
+    return list(deduped.values())
+
+
+def load_human_feedback_cases(
+    path: Path = DEFAULT_FEEDBACK_PATH,
+    progress: ProgressCallback = None,
+) -> Tuple[List[TrainingCase], HumanFeedbackSummary]:
+    summary = HumanFeedbackSummary()
+    if not path.exists():
+        emit_progress(progress, f"[feedback] no human feedback file at {path}")
+        return [], summary
+
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    summary.records_seen = len(rows)
+    deduped_rows = _dedupe_feedback_records(rows)
+    summary.unique_entries = len(deduped_rows)
+
+    cases: List[TrainingCase] = []
+    for record in deduped_rows:
+        snapshot = record.get("state_snapshot")
+        chosen_payload = record.get("chosen_action", {})
+        if not snapshot:
+            summary.skipped_missing_state += 1
+            continue
+
+        state, exact_stock = reconstruct_feedback_state(snapshot)
+        actions = available_actions(state)
+        if not actions:
+            summary.skipped_missing_action += 1
+            continue
+
+        signatures = [action_signature(state, action) for action in actions]
+        matched_index = next((index for index, action in enumerate(actions) if action_payload_matches(action, chosen_payload)), None)
+        if matched_index is None:
+            summary.skipped_missing_action += 1
+            continue
+
+        heuristic_scores = {signature: evaluate_action(state, action) for signature, action in zip(signatures, actions)}
+        chosen_signature = signatures[matched_index]
+        best_non_chosen = max((score for signature, score in heuristic_scores.items() if signature != chosen_signature), default=0.0)
+        ranked_map = dict(heuristic_scores)
+        ranked_map[chosen_signature] = max(ranked_map[chosen_signature], best_non_chosen + 30.0)
+        soft_targets = teacher_soft_targets(signatures, ranked_map)
+        weight = _feedback_strength_weight(str(record.get("feedback_strength", "normal")))
+        if move_creates_hole(state, actions[matched_index]):
+            weight += 1.0
+        if not exact_stock:
+            weight *= 0.8
+            summary.inferred_stock_cases += 1
+
+        cases.append(
+            TrainingCase(
+                features=np.vstack([encode_action(state, action) for action in actions]),
+                target_index=matched_index,
+                weight=weight,
+                chosen_signature=chosen_signature,
+                action_signatures=signatures,
+                soft_targets=soft_targets,
+            )
+        )
+
+    summary.cases_loaded = len(cases)
+    emit_progress(
+        progress,
+        "[feedback] loaded "
+        f"{summary.cases_loaded}/{summary.unique_entries} human cases "
+        f"(records={summary.records_seen}, inferred_stock={summary.inferred_stock_cases}, "
+        f"skipped_missing_state={summary.skipped_missing_state}, skipped_missing_action={summary.skipped_missing_action})",
+    )
+    return cases, summary
 
 
 def enqueue_alternate_states(

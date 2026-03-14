@@ -39,6 +39,19 @@ def test_existing_game_state_can_be_reloaded():
     assert loaded.json()["game_id"] == game_id
 
 
+def test_session_store_recovers_game_after_memory_is_cleared(tmp_path):
+    store = api_module.SessionStore(storage_dir=tmp_path / "sessions")
+    created = store.create(seed=6)
+    game_id = created.game_id
+    created.history.append(created.state.clone())
+    store._save(created)
+
+    reloaded_store = api_module.SessionStore(storage_dir=tmp_path / "sessions")
+    recovered = reloaded_store.get(game_id)
+    assert recovered.game_id == game_id
+    assert len(recovered.history) == 2
+
+
 def test_concede_changes_status():
     response = client.post("/game/new", json={"seed": 8})
     game_id = response.json()["game_id"]
@@ -89,3 +102,5 @@ def test_feedback_endpoint_saves_human_correction(tmp_path, monkeypatch):
     assert saved["chosen_action"]["type"] == "deal"
     assert saved["feedback_strength"] == "key_move"
     assert saved["applies_to"] == "planned_move"
+    assert "stock_cards" in saved["state_snapshot"]
+    assert len(saved["state_snapshot"]["stock_cards"]) == saved["state_snapshot"]["stock_count"]

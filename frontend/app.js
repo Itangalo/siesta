@@ -54,6 +54,7 @@ const state = {
   feedbackStatus: "",
   savedFeedbackKeys: new Set(),
   lastFeedback: null,
+  hoveredCardCode: null,
   aiRequestId: 0,
   aiLoading: false,
   aiAbortController: null,
@@ -115,6 +116,15 @@ function readStoredGameId() {
   }
 }
 
+function readUrlGameId() {
+  try {
+    const url = new URL(window.location.href);
+    return url.searchParams.get("game_id");
+  } catch (_) {
+    return null;
+  }
+}
+
 function storeActiveGameId(gameId) {
   try {
     if (gameId) {
@@ -124,6 +134,20 @@ function storeActiveGameId(gameId) {
     }
   } catch (_) {
     // Ignore storage errors; the game still works without persistence.
+  }
+}
+
+function syncUrlGameId(gameId) {
+  try {
+    const url = new URL(window.location.href);
+    if (gameId) {
+      url.searchParams.set("game_id", gameId);
+    } else {
+      url.searchParams.delete("game_id");
+    }
+    window.history.replaceState({}, "", url);
+  } catch (_) {
+    // Ignore URL update failures.
   }
 }
 
@@ -208,7 +232,7 @@ function updateFeedbackPanel() {
   const summary = document.getElementById("ai-summary");
   const pendingPanel = document.getElementById("pending-feedback-panel");
   const pendingText = document.getElementById("pending-feedback-text");
-  const lastPanel = document.getElementById("last-feedback-panel");
+  const lastPanel = document.getElementById("board-callout");
   const lastText = document.getElementById("last-feedback-text");
   const status = document.getElementById("feedback-status");
   status.textContent = state.feedbackStatus;
@@ -306,6 +330,13 @@ function renderSuggestions() {
   });
 }
 
+function syncHoveredCardHighlight() {
+  document.querySelectorAll("[data-card-code]").forEach((element) => {
+    const matches = !!state.hoveredCardCode && element.dataset.cardCode === state.hoveredCardCode;
+    element.classList.toggle("hover-match", matches);
+  });
+}
+
 function renderStockOverview() {
   const container = document.getElementById("stock-overview");
   if (!state.snapshot) {
@@ -324,7 +355,7 @@ function renderStockOverview() {
     const cells = RANK_ORDER.map((rank) => {
       const code = cardCode(rank, suit);
       const inStock = !dealtCards.has(code);
-      return `<span class="stock-card suit-${suit} ${inStock ? "in-stock" : "dealt"}" title="${code}">
+      return `<span class="stock-card suit-${suit} ${inStock ? "in-stock" : "dealt"}" data-card-code="${code}" title="${code}">
         <span class="stock-rank">${rankLabel(rank)}</span>
         <span class="stock-suit">${SUIT_GLYPHS[suit]}</span>
       </span>`;
@@ -335,6 +366,19 @@ function renderStockOverview() {
       <div class="stock-row-cards">${cells}</div>
     </div>`;
   }).join("");
+
+  container.querySelectorAll(".stock-card").forEach((cardElement) => {
+    cardElement.addEventListener("mouseenter", () => {
+      state.hoveredCardCode = cardElement.dataset.cardCode || null;
+      syncHoveredCardHighlight();
+    });
+    cardElement.addEventListener("mouseleave", () => {
+      state.hoveredCardCode = null;
+      syncHoveredCardHighlight();
+    });
+  });
+
+  syncHoveredCardHighlight();
 }
 
 function renderBoard() {
@@ -349,6 +393,8 @@ function renderBoard() {
 
     const stack = document.createElement("div");
     stack.className = `stack ${column.cards.length === 0 ? "empty" : ""}`;
+    const stackHeight = column.cards.length ? Math.max(416, 88 + (column.cards.length - 1) * 28 + 116) : 416;
+    stack.style.height = `${stackHeight}px`;
     stack.addEventListener("dragover", (event) => event.preventDefault());
     stack.addEventListener("drop", async (event) => {
       event.preventDefault();
@@ -384,6 +430,7 @@ function renderBoard() {
           movable;
 
         cardElement.className = `card ${card.color} suit-${card.suit} ${movable ? "movable" : ""} ${selected ? "selected" : ""}`;
+        cardElement.dataset.cardCode = card.code;
         cardElement.innerHTML = cardMarkup(card);
         cardElement.style.top = `${cardIndex * 28}px`;
         if (movable) {
@@ -411,6 +458,8 @@ function renderBoard() {
     columnElement.appendChild(stack);
     board.appendChild(columnElement);
   });
+
+  syncHoveredCardHighlight();
 }
 
 function render() {
@@ -426,6 +475,7 @@ function applySnapshot(snapshot) {
   state.selection = null;
   state.selectionTarget = null;
   storeActiveGameId(snapshot.game_id);
+  syncUrlGameId(snapshot.game_id);
   render();
   if (autoAiEnabled() && snapshot.status === "in_progress") {
     loadSuggestions({ silentIfCurrent: true }).catch((error) => {
@@ -450,7 +500,7 @@ async function startNewGame() {
 }
 
 async function restoreStoredGame() {
-  const gameId = readStoredGameId();
+  const gameId = readUrlGameId() || readStoredGameId();
   if (!gameId) {
     return false;
   }
@@ -465,6 +515,7 @@ async function restoreStoredGame() {
     return true;
   } catch (error) {
     storeActiveGameId(null);
+    syncUrlGameId(null);
     if (!String(error.message).includes("Unknown game_id")) {
       throw error;
     }
