@@ -55,6 +55,7 @@ const state = {
   savedFeedbackKeys: new Set(),
   lastFeedback: null,
   hoveredCardCode: null,
+  hoveredSuggestion: null,
   aiRequestId: 0,
   aiLoading: false,
   aiAbortController: null,
@@ -319,6 +320,20 @@ function renderSuggestions() {
     .join("");
 
   container.querySelectorAll(".suggestion-item").forEach((button) => {
+    button.addEventListener("mouseenter", () => {
+      const type = button.dataset.type;
+      state.hoveredSuggestion = {
+        type,
+        fromColumn: type === "move" ? Number(button.dataset.from) : null,
+        toColumn: type === "move" ? Number(button.dataset.to) : null,
+        runLength: type === "move" ? Number(button.dataset.run) : null,
+      };
+      renderBoard();
+    });
+    button.addEventListener("mouseleave", () => {
+      state.hoveredSuggestion = null;
+      renderBoard();
+    });
     button.addEventListener("click", async () => {
       if (button.dataset.type === "deal") {
         await performDeal();
@@ -393,6 +408,13 @@ function renderBoard() {
 
     const stack = document.createElement("div");
     stack.className = `stack ${column.cards.length === 0 ? "empty" : ""}`;
+    const suggestionTargetsColumn =
+      state.hoveredSuggestion &&
+      state.hoveredSuggestion.type === "move" &&
+      state.hoveredSuggestion.toColumn === columnIndex;
+    if (suggestionTargetsColumn) {
+      stack.classList.add("suggestion-target");
+    }
     const stackHeight = column.cards.length ? Math.max(416, 88 + (column.cards.length - 1) * 28 + 116) : 416;
     stack.style.height = `${stackHeight}px`;
     stack.addEventListener("dragover", (event) => event.preventDefault());
@@ -428,8 +450,24 @@ function renderBoard() {
           state.selection.fromColumn === columnIndex &&
           state.selection.runLength === runLength &&
           movable;
+        const isSuggestedSource =
+          state.hoveredSuggestion &&
+          state.hoveredSuggestion.type === "move" &&
+          state.hoveredSuggestion.fromColumn === columnIndex &&
+          column.cards.length - cardIndex <= state.hoveredSuggestion.runLength;
+        const isSuggestedDestination =
+          state.hoveredSuggestion &&
+          state.hoveredSuggestion.type === "move" &&
+          state.hoveredSuggestion.toColumn === columnIndex &&
+          cardIndex === column.cards.length - 1;
 
         cardElement.className = `card ${card.color} suit-${card.suit} ${movable ? "movable" : ""} ${selected ? "selected" : ""}`;
+        if (isSuggestedSource) {
+          cardElement.classList.add("suggestion-source");
+        }
+        if (isSuggestedDestination) {
+          cardElement.classList.add("suggestion-destination");
+        }
         cardElement.dataset.cardCode = card.code;
         cardElement.innerHTML = cardMarkup(card);
         cardElement.style.top = `${cardIndex * 28}px`;
@@ -474,6 +512,7 @@ function applySnapshot(snapshot) {
   state.gameId = snapshot.game_id;
   state.selection = null;
   state.selectionTarget = null;
+  state.hoveredSuggestion = null;
   storeActiveGameId(snapshot.game_id);
   syncUrlGameId(snapshot.game_id);
   render();
