@@ -21,6 +21,10 @@
           <button id="deal">Dela kort</button>
           <button id="undo">Ångra</button>
           <button id="suggest">AI-förslag</button>
+          <label class="toggle">
+            <input id="auto-ai" type="checkbox" checked />
+            <span>AI auto</span>
+          </label>
           <button id="concede" class="danger">Ge upp</button>
         </div>
       </header>
@@ -44,20 +48,59 @@
         </div>
       </section>
 
-      <section class="selection-panel">
-        <div id="selection-text">Ingen flytt vald.</div>
-        <div id="ai-summary" class="ai-summary">Ladda AI-förslag för att se hur agenten resonerar.</div>
-        <div id="feedback-panel" class="feedback-panel hidden">
-          <div id="feedback-text"></div>
-          <button id="save-feedback" type="button">Spara korrigering</button>
-        </div>
-        <div id="feedback-status" class="feedback-status"></div>
-        <div id="suggestions" class="suggestions empty">Inga AI-förslag laddade.</div>
-      </section>
-
       <main>
         <section id="board" class="board"></section>
       </main>
+
+      <section class="insight-grid">
+        <section class="stock-panel">
+          <div class="panel-header">
+            <div>
+              <span class="label">Talongöversikt</span>
+              <strong>Kvar att dela ut</strong>
+            </div>
+            <div class="stock-legend">
+              <span class="stock-chip in-stock">I talongen</span>
+              <span class="stock-chip dealt">Redan delat</span>
+            </div>
+          </div>
+          <div id="stock-overview" class="stock-overview"></div>
+        </section>
+
+        <section class="selection-panel compact">
+          <div class="panel-header">
+            <div>
+              <span class="label">AI-stöd</span>
+              <strong id="selection-text">Ingen flytt vald.</strong>
+            </div>
+          </div>
+          <div id="ai-summary" class="ai-summary">Ladda AI-förslag för att se hur agenten resonerar.</div>
+          <div id="pending-feedback-panel" class="feedback-panel hidden">
+            <div>
+              <div class="feedback-title">Gäller draget du kommer att göra</div>
+              <div id="pending-feedback-text"></div>
+            </div>
+            <div class="feedback-actions">
+              <button id="pending-normal" type="button">Spara</button>
+              <button id="pending-important" type="button">Viktig</button>
+              <button id="pending-key" type="button">Nyckeldrag</button>
+            </div>
+          </div>
+          <div id="last-feedback-panel" class="feedback-panel hidden">
+            <div>
+              <div class="feedback-title">Gäller draget du just gjorde</div>
+              <div id="last-feedback-text"></div>
+            </div>
+            <div class="feedback-actions">
+              <button id="last-normal" type="button">Spara</button>
+              <button id="last-important" type="button">Viktig</button>
+              <button id="last-key" type="button">Nyckeldrag</button>
+            </div>
+          </div>
+          <div id="feedback-status" class="feedback-status"></div>
+          <div id="suggestions" class="suggestions empty">Inga AI-förslag laddade.</div>
+        </section>
+      </section>
     </div>
     <script src="/static/app.js"></script>
   </body>

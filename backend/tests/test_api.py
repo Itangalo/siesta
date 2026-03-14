@@ -31,6 +31,14 @@ def test_invalid_move_returns_bad_request():
     assert invalid.status_code == 400
 
 
+def test_existing_game_state_can_be_reloaded():
+    response = client.post("/game/new", json={"seed": 5})
+    game_id = response.json()["game_id"]
+    loaded = client.get("/game/state", params={"game_id": game_id})
+    assert loaded.status_code == 200
+    assert loaded.json()["game_id"] == game_id
+
+
 def test_concede_changes_status():
     response = client.post("/game/new", json={"seed": 8})
     game_id = response.json()["game_id"]
@@ -66,6 +74,8 @@ def test_feedback_endpoint_saves_human_correction(tmp_path, monkeypatch):
             "ai_source": "search",
             "model_loaded": suggestions["model_loaded"],
             "model_eligible": suggestions["model_eligible"],
+            "feedback_strength": "key_move",
+            "applies_to": "planned_move",
             "recommended_action": suggestions["suggestions"][0],
             "chosen_action": {"type": "deal", "description": "Deal from stock"},
             "candidate_actions": suggestions["suggestions"],
@@ -77,3 +87,5 @@ def test_feedback_endpoint_saves_human_correction(tmp_path, monkeypatch):
     saved = json.loads((tmp_path / "human_feedback.jsonl").read_text(encoding="utf-8").strip())
     assert saved["game_id"] == game_id
     assert saved["chosen_action"]["type"] == "deal"
+    assert saved["feedback_strength"] == "key_move"
+    assert saved["applies_to"] == "planned_move"

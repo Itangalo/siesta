@@ -108,6 +108,8 @@ class FeedbackRequest(BaseModel):
     ai_source: str
     model_loaded: bool = False
     model_eligible: bool = False
+    feedback_strength: str = Field(default="normal")
+    applies_to: str = Field(default="last_move")
     recommended_action: Dict[str, Any]
     chosen_action: Dict[str, Any]
     candidate_actions: List[Dict[str, Any]] = Field(default_factory=list)
@@ -160,6 +162,12 @@ def health() -> Dict[str, str]:
 @app.post("/game/new")
 def new_game(request: NewGameRequest) -> Dict[str, Any]:
     session = store.create(seed=request.seed)
+    return _serialize_session(session)
+
+
+@app.get("/game/state")
+def get_game_state(game_id: str) -> Dict[str, Any]:
+    session = _get_session(game_id)
     return _serialize_session(session)
 
 
@@ -227,9 +235,7 @@ def evaluate_move(request: GameActionRequest) -> Dict[str, Any]:
 
 @app.post("/ai/feedback")
 def save_feedback(request: FeedbackRequest) -> Dict[str, Any]:
-    session = _get_session(request.game_id)
-    if session.state.state_hash != request.state_hash:
-        raise HTTPException(status_code=409, detail="Feedback state_hash does not match the current game state.")
+    _get_session(request.game_id)
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     record = {
@@ -239,6 +245,8 @@ def save_feedback(request: FeedbackRequest) -> Dict[str, Any]:
         "ai_source": request.ai_source,
         "model_loaded": request.model_loaded,
         "model_eligible": request.model_eligible,
+        "feedback_strength": request.feedback_strength,
+        "applies_to": request.applies_to,
         "recommended_action": request.recommended_action,
         "chosen_action": request.chosen_action,
         "candidate_actions": request.candidate_actions,

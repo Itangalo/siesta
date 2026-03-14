@@ -46,7 +46,8 @@ button.danger {
 
 .hero,
 .status-panel,
-.selection-panel {
+.selection-panel,
+.stock-panel {
   background: var(--panel);
   backdrop-filter: blur(8px);
   border-radius: 24px;
@@ -86,10 +87,27 @@ button.danger {
   gap: 0.75rem;
   flex-wrap: wrap;
   justify-content: flex-end;
+  align-items: center;
+}
+
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.7rem 0.95rem;
+  border-radius: 999px;
+  background: rgba(15, 91, 74, 0.09);
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px rgba(15, 91, 74, 0.12);
+}
+
+.toggle input {
+  accent-color: var(--accent);
 }
 
 .status-panel,
-.selection-panel {
+.selection-panel,
+.stock-panel {
   margin-top: 1rem;
   padding: 1rem 1.2rem;
 }
@@ -108,16 +126,38 @@ button.danger {
   letter-spacing: 0.1em;
 }
 
+.insight-grid {
+  margin-top: 1.2rem;
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 0.95fr);
+  align-items: start;
+}
+
+.panel-header {
+  display: flex;
+  gap: 1rem;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 0.7rem;
+}
+
+.selection-panel.compact {
+  padding-top: 0.9rem;
+}
+
 .suggestions {
   display: grid;
-  gap: 0.6rem;
+  gap: 0.5rem;
   margin-top: 0.8rem;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
 }
 
 .ai-summary,
 .feedback-status {
-  margin-top: 0.8rem;
+  margin-top: 0.65rem;
   color: var(--muted);
+  font-size: 0.95rem;
 }
 
 .feedback-panel {
@@ -127,12 +167,31 @@ button.danger {
   background: rgba(15, 91, 74, 0.08);
   display: flex;
   gap: 0.8rem;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
 }
 
 .feedback-panel.hidden {
   display: none;
+}
+
+.feedback-title {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  margin-bottom: 0.25rem;
+}
+
+.feedback-actions {
+  display: flex;
+  gap: 0.55rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.feedback-actions button {
+  box-shadow: none;
 }
 
 .suggestions.empty {
@@ -144,16 +203,127 @@ button.danger {
   text-align: left;
   background: #21473a;
   display: grid;
-  gap: 0.3rem;
+  gap: 0.18rem;
+  padding: 0.7rem 0.9rem;
+  border-radius: 18px;
+  box-shadow: none;
 }
 
 .suggestion-main {
   font-weight: 700;
+  font-size: 0.95rem;
 }
 
 .suggestion-meta {
-  font-size: 0.88rem;
+  font-size: 0.78rem;
   opacity: 0.88;
+}
+
+.stock-legend {
+  display: flex;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.stock-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.28rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.74rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.stock-chip.in-stock {
+  background: rgba(15, 91, 74, 0.11);
+  color: var(--accent);
+}
+
+.stock-chip.dealt {
+  background: rgba(83, 99, 90, 0.12);
+  color: var(--muted);
+}
+
+.stock-overview {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.stock-row {
+  display: grid;
+  gap: 0.45rem;
+  grid-template-columns: 6.8rem minmax(0, 1fr);
+  align-items: center;
+}
+
+.stock-row-label {
+  font-size: 0.84rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.stock-row-label.suit-hearts {
+  color: #b03131;
+}
+
+.stock-row-label.suit-diamonds {
+  color: #d17a00;
+}
+
+.stock-row-label.suit-clubs {
+  color: #116466;
+}
+
+.stock-row-label.suit-spades {
+  color: #284b8f;
+}
+
+.stock-row-cards {
+  display: grid;
+  gap: 0.3rem;
+  grid-template-columns: repeat(13, minmax(0, 1fr));
+}
+
+.stock-card {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.12rem;
+  padding: 0.34rem 0.1rem;
+  border-radius: 10px;
+  border: 1px solid rgba(23, 35, 29, 0.08);
+  font-size: 0.8rem;
+  font-weight: 700;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.stock-card.in-stock {
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px rgba(15, 91, 74, 0.14);
+}
+
+.stock-card.dealt {
+  color: rgba(83, 99, 90, 0.55);
+  background: rgba(83, 99, 90, 0.08);
+}
+
+.stock-card.suit-hearts.in-stock {
+  color: #b03131;
+}
+
+.stock-card.suit-diamonds.in-stock {
+  color: #d17a00;
+}
+
+.stock-card.suit-clubs.in-stock {
+  color: #116466;
+}
+
+.stock-card.suit-spades.in-stock {
+  color: #284b8f;
 }
 
 .board {
@@ -215,6 +385,7 @@ button.danger {
   font-weight: 700;
   font-size: 1.2rem;
   user-select: none;
+  border-left: 0.45rem solid transparent;
 }
 
 .card-corner {
@@ -231,6 +402,12 @@ button.danger {
   box-shadow: 0 4px 10px rgba(23, 35, 29, 0.1);
   font-size: 0.82rem;
   line-height: 1;
+}
+
+.card-suit-label {
+  font-size: 0.64rem;
+  letter-spacing: 0.08em;
+  font-weight: 800;
 }
 
 .card-rank {
@@ -252,6 +429,16 @@ button.danger {
   letter-spacing: 0.03em;
 }
 
+.card-watermark {
+  position: absolute;
+  right: 0.7rem;
+  bottom: -0.25rem;
+  font-size: 4rem;
+  line-height: 1;
+  opacity: 0.17;
+  font-weight: 900;
+}
+
 .card.red {
   color: #b03131;
 }
@@ -270,6 +457,63 @@ button.danger {
   transform: translateX(8px);
 }
 
+.card.suit-hearts {
+  border-left-color: #b03131;
+}
+
+.card.suit-diamonds {
+  border-left-color: #d17a00;
+}
+
+.card.suit-clubs {
+  border-left-color: #116466;
+}
+
+.card.suit-spades {
+  border-left-color: #284b8f;
+}
+
+.card-corner.suit-hearts {
+  background:
+    repeating-linear-gradient(135deg, rgba(176, 49, 49, 0.2) 0 4px, rgba(176, 49, 49, 0.05) 4px 8px),
+    rgba(255, 255, 255, 0.96);
+}
+
+.card-corner.suit-diamonds {
+  background:
+    radial-gradient(circle at 20% 30%, rgba(209, 122, 0, 0.24) 0 2px, transparent 2px 100%),
+    radial-gradient(circle at 75% 70%, rgba(209, 122, 0, 0.18) 0 2px, transparent 2px 100%),
+    rgba(255, 255, 255, 0.96);
+}
+
+.card-corner.suit-clubs {
+  background:
+    repeating-linear-gradient(0deg, rgba(17, 100, 102, 0.18) 0 2px, transparent 2px 6px),
+    rgba(255, 255, 255, 0.96);
+}
+
+.card-corner.suit-spades {
+  background:
+    repeating-linear-gradient(90deg, rgba(40, 75, 143, 0.18) 0 3px, transparent 3px 7px),
+    rgba(255, 255, 255, 0.96);
+}
+
+.card-watermark.suit-hearts {
+  color: #b03131;
+}
+
+.card-watermark.suit-diamonds {
+  color: #d17a00;
+}
+
+.card-watermark.suit-clubs {
+  color: #116466;
+}
+
+.card-watermark.suit-spades {
+  color: #284b8f;
+}
+
 @media (max-width: 1100px) {
   .hero {
     grid-template-columns: 1fr;
@@ -277,6 +521,10 @@ button.danger {
 
   .status-panel {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .insight-grid {
+    grid-template-columns: 1fr;
   }
 
   .board {
@@ -297,8 +545,25 @@ button.danger {
     justify-content: flex-start;
   }
 
+  .panel-header,
   .feedback-panel {
     flex-direction: column;
     align-items: stretch;
+  }
+
+  .feedback-actions {
+    justify-content: stretch;
+  }
+
+  .suggestions {
+    grid-template-columns: 1fr;
+  }
+
+  .stock-row {
+    grid-template-columns: 1fr;
+  }
+
+  .stock-row-cards {
+    grid-template-columns: repeat(7, minmax(0, 1fr));
   }
 }

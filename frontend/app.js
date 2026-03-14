@@ -1,3 +1,49 @@
+const SUIT_GLYPHS = {
+  hearts: "♥",
+  diamonds: "♦",
+  clubs: "♣",
+  spades: "♠",
+};
+
+const SUIT_LABELS = {
+  hearts: "HJ",
+  diamonds: "RU",
+  clubs: "KL",
+  spades: "SP",
+};
+
+const SUIT_CODES = {
+  hearts: "H",
+  diamonds: "D",
+  clubs: "C",
+  spades: "S",
+};
+
+const SUIT_ROW_ORDER = [
+  { suit: "spades", label: "Spader" },
+  { suit: "hearts", label: "Hjarter" },
+  { suit: "clubs", label: "Klover" },
+  { suit: "diamonds", label: "Ruter" },
+];
+
+const RANK_ORDER = [13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1];
+
+const RANK_LABELS = {
+  1: "A",
+  11: "J",
+  12: "Q",
+  13: "K",
+};
+
+const FEEDBACK_LABELS = {
+  normal: "sparad",
+  important: "viktig korrigering",
+  key_move: "nyckeldrag",
+};
+
+const ACTIVE_GAME_STORAGE_KEY = "siesta.activeGameId";
+const AI_REQUEST_TIMEOUT_MS = 3500;
+
 const state = {
   gameId: null,
   snapshot: null,
@@ -6,7 +52,11 @@ const state = {
   suggestions: [],
   aiContext: null,
   feedbackStatus: "",
-  savedFeedbackKey: null,
+  savedFeedbackKeys: new Set(),
+  lastFeedback: null,
+  aiRequestId: 0,
+  aiLoading: false,
+  aiAbortController: null,
 };
 
 async function api(path, options = {}) {
@@ -21,18 +71,68 @@ async function api(path, options = {}) {
   return data;
 }
 
+function suitGlyph(card) {
+  return SUIT_GLYPHS[card.suit] || card.suit_symbol;
+}
+
+function suitLabel(card) {
+  return SUIT_LABELS[card.suit] || card.suit_symbol;
+}
+
 function cardSymbol(card) {
-  return `${card.rank_label}${card.suit_symbol}`;
+  return `${card.rank_label}${suitGlyph(card)}`;
+}
+
+function rankLabel(rank) {
+  return RANK_LABELS[rank] || String(rank);
+}
+
+function cardCode(rank, suit) {
+  return `${rankLabel(rank)}${SUIT_CODES[suit]}`;
 }
 
 function cardMarkup(card) {
   return `
-    <span class="card-corner" aria-hidden="true">
+    <span class="card-corner suit-${card.suit}" aria-hidden="true">
       <span class="card-rank">${card.rank_label}</span>
-      <span class="card-suit">${card.suit_symbol}</span>
+      <span class="card-suit">${suitGlyph(card)}</span>
+      <span class="card-suit-label">${suitLabel(card)}</span>
     </span>
+    <span class="card-watermark suit-${card.suit}" aria-hidden="true">${suitGlyph(card)}</span>
     <span class="card-face" aria-hidden="true">${cardSymbol(card)}</span>
   `;
+}
+
+function autoAiEnabled() {
+  return document.getElementById("auto-ai").checked;
+}
+
+function readStoredGameId() {
+  try {
+    return window.localStorage.getItem(ACTIVE_GAME_STORAGE_KEY);
+  } catch (_) {
+    return null;
+  }
+}
+
+function storeActiveGameId(gameId) {
+  try {
+    if (gameId) {
+      window.localStorage.setItem(ACTIVE_GAME_STORAGE_KEY, gameId);
+    } else {
+      window.localStorage.removeItem(ACTIVE_GAME_STORAGE_KEY);
+    }
+  } catch (_) {
+    // Ignore storage errors; the game still works without persistence.
+  }
+}
+
+function cancelPendingAiRequest() {
+  if (state.aiAbortController) {
+    state.aiAbortController.abort();
+    state.aiAbortController = null;
+  }
+  state.aiLoading = false;
 }
 
 function actionKey(action) {
@@ -43,6 +143,10 @@ function actionKey(action) {
     return "deal";
   }
   return `${action.type}:${action.from_column}:${action.to_column}:${action.run_length}`;
+}
+
+function feedbackKey(stateHash, action, strength, appliesTo) {
+  return `${stateHash}:${actionKey(action)}:${strength}:${appliesTo}`;
 }
 
 function rankingSource() {
@@ -71,6 +175,10 @@ function chosenMoveAction(fromColumn, toColumn, runLength) {
   };
 }
 
+function dealAction() {
+  return { type: "deal", description: `Deal from stock (${state.snapshot.stock_count} left)` };
+}
+
 function currentCorrectionCandidate() {
   if (!state.aiContext || !state.aiContext.suggestions.length) {
     return null;
@@ -83,38 +191,68 @@ function currentCorrectionCandidate() {
   if (actionKey(chosenAction) === actionKey(topSuggestion)) {
     return null;
   }
-  return { chosenAction, topSuggestion };
+  return {
+    gameId: state.gameId,
+    stateHash: state.snapshot.state_hash,
+    stateSnapshot: state.snapshot,
+    aiSource: rankingSource(),
+    modelLoaded: state.aiContext.modelLoaded,
+    modelEligible: state.aiContext.modelEligible,
+    topSuggestion,
+    chosenAction,
+    candidateActions: state.aiContext.suggestions,
+  };
 }
 
 function updateFeedbackPanel() {
   const summary = document.getElementById("ai-summary");
-  const panel = document.getElementById("feedback-panel");
-  const text = document.getElementById("feedback-text");
+  const pendingPanel = document.getElementById("pending-feedback-panel");
+  const pendingText = document.getElementById("pending-feedback-text");
+  const lastPanel = document.getElementById("last-feedback-panel");
+  const lastText = document.getElementById("last-feedback-text");
   const status = document.getElementById("feedback-status");
   status.textContent = state.feedbackStatus;
 
+  if (state.aiLoading && (!state.aiContext || state.aiContext.stateHash !== state.snapshot?.state_hash)) {
+    summary.textContent = "AI analyserar nuvarande läge...";
+    pendingPanel.classList.add("hidden");
+    lastPanel.classList.add("hidden");
+    pendingText.textContent = "";
+    lastText.textContent = "";
+    return;
+  }
+
   if (!state.aiContext || !state.aiContext.suggestions.length) {
-    summary.textContent = "Ladda AI-förslag för att se hur agenten resonerar.";
-    panel.classList.add("hidden");
-    text.textContent = "";
+    summary.textContent = autoAiEnabled()
+      ? "AI auto är på. Förslag laddas automatiskt för nuvarande läge."
+      : "Ladda AI-förslag för att se hur agenten resonerar.";
+    pendingPanel.classList.add("hidden");
+    pendingText.textContent = "";
+  } else {
+    const source = rankingSource() === "model" ? "modellen" : "search-läraren";
+    const top = state.aiContext.suggestions[0];
+    const searchPart = top.search_score === null || top.search_score === undefined ? "" : ` | search ${top.search_score.toFixed(1)}`;
+    const modelPart = top.model_score === null || top.model_score === undefined ? "" : ` | modell ${top.model_score.toFixed(2)}`;
+    summary.textContent = `Aktiv AI-källa: ${source}. Toppförslag: ${top.description}${searchPart}${modelPart}.`;
+
+    const candidate = currentCorrectionCandidate();
+    if (!candidate) {
+      pendingPanel.classList.add("hidden");
+      pendingText.textContent = "";
+    } else {
+      pendingPanel.classList.remove("hidden");
+      pendingText.textContent = `Om du tänker spela ${candidate.chosenAction.description} i stället för AI:ns toppförslag ${candidate.topSuggestion.description}, markera det här innan du gör draget.`;
+    }
+  }
+
+  if (!state.lastFeedback) {
+    lastPanel.classList.add("hidden");
+    lastText.textContent = "";
     return;
   }
 
-  const source = rankingSource() === "model" ? "modellen" : "search-läraren";
-  const top = state.aiContext.suggestions[0];
-  const searchPart = top.search_score === null || top.search_score === undefined ? "" : ` | search ${top.search_score.toFixed(1)}`;
-  const modelPart = top.model_score === null || top.model_score === undefined ? "" : ` | modell ${top.model_score.toFixed(2)}`;
-  summary.textContent = `Aktiv AI-källa: ${source}. Toppförslag: ${top.description}${searchPart}${modelPart}.`;
-
-  const candidate = currentCorrectionCandidate();
-  if (!candidate) {
-    panel.classList.add("hidden");
-    text.textContent = "";
-    return;
-  }
-
-  panel.classList.remove("hidden");
-  text.textContent = `Du håller på att spela ${candidate.chosenAction.description} i stället för AI:ns toppförslag ${candidate.topSuggestion.description}.`;
+  lastPanel.classList.remove("hidden");
+  lastText.textContent = `Senaste egna drag: ${state.lastFeedback.chosenAction.description}. AI:s toppförslag var ${state.lastFeedback.topSuggestion.description}. Markera här om draget du just gjorde bör väga extra tungt i träningen.`;
 }
 
 function updateStatus() {
@@ -134,7 +272,7 @@ function renderSuggestions() {
   const container = document.getElementById("suggestions");
   if (!state.suggestions.length) {
     container.className = "suggestions empty";
-    container.textContent = "Inga AI-förslag laddade.";
+    container.textContent = state.aiLoading ? "AI analyserar..." : "Inga AI-förslag laddade.";
     return;
   }
   container.className = "suggestions";
@@ -166,6 +304,37 @@ function renderSuggestions() {
       await performMove(Number(button.dataset.from), Number(button.dataset.to), Number(button.dataset.run));
     });
   });
+}
+
+function renderStockOverview() {
+  const container = document.getElementById("stock-overview");
+  if (!state.snapshot) {
+    container.innerHTML = "";
+    return;
+  }
+
+  const dealtCards = new Set();
+  state.snapshot.columns.forEach((column) => {
+    column.cards.forEach((card) => {
+      dealtCards.add(card.code);
+    });
+  });
+
+  container.innerHTML = SUIT_ROW_ORDER.map(({ suit, label }) => {
+    const cells = RANK_ORDER.map((rank) => {
+      const code = cardCode(rank, suit);
+      const inStock = !dealtCards.has(code);
+      return `<span class="stock-card suit-${suit} ${inStock ? "in-stock" : "dealt"}" title="${code}">
+        <span class="stock-rank">${rankLabel(rank)}</span>
+        <span class="stock-suit">${SUIT_GLYPHS[suit]}</span>
+      </span>`;
+    }).join("");
+
+    return `<div class="stock-row">
+      <div class="stock-row-label suit-${suit}">${label} ${SUIT_GLYPHS[suit]}</div>
+      <div class="stock-row-cards">${cells}</div>
+    </div>`;
+  }).join("");
 }
 
 function renderBoard() {
@@ -214,7 +383,7 @@ function renderBoard() {
           state.selection.runLength === runLength &&
           movable;
 
-        cardElement.className = `card ${card.color} ${movable ? "movable" : ""} ${selected ? "selected" : ""}`;
+        cardElement.className = `card ${card.color} suit-${card.suit} ${movable ? "movable" : ""} ${selected ? "selected" : ""}`;
         cardElement.innerHTML = cardMarkup(card);
         cardElement.style.top = `${cardIndex * 28}px`;
         if (movable) {
@@ -246,8 +415,9 @@ function renderBoard() {
 
 function render() {
   updateStatus();
-  renderSuggestions();
   renderBoard();
+  renderStockOverview();
+  renderSuggestions();
 }
 
 function applySnapshot(snapshot) {
@@ -255,10 +425,18 @@ function applySnapshot(snapshot) {
   state.gameId = snapshot.game_id;
   state.selection = null;
   state.selectionTarget = null;
+  storeActiveGameId(snapshot.game_id);
   render();
+  if (autoAiEnabled() && snapshot.status === "in_progress") {
+    loadSuggestions({ silentIfCurrent: true }).catch((error) => {
+      state.feedbackStatus = error.message;
+      updateFeedbackPanel();
+    });
+  }
 }
 
 async function startNewGame() {
+  cancelPendingAiRequest();
   const snapshot = await api("/game/new", {
     method: "POST",
     body: JSON.stringify({}),
@@ -266,47 +444,100 @@ async function startNewGame() {
   state.suggestions = [];
   state.aiContext = null;
   state.feedbackStatus = "";
-  state.savedFeedbackKey = null;
+  state.savedFeedbackKeys = new Set();
+  state.lastFeedback = null;
   applySnapshot(snapshot);
 }
 
-async function saveCorrection(chosenAction, note = "human correction") {
-  if (!state.aiContext || !state.aiContext.suggestions.length) {
-    return;
+async function restoreStoredGame() {
+  const gameId = readStoredGameId();
+  if (!gameId) {
+    return false;
   }
-  const topSuggestion = state.aiContext.suggestions[0];
-  if (actionKey(chosenAction) === actionKey(topSuggestion)) {
-    return;
+
+  try {
+    const snapshot = await api(`/game/state?game_id=${encodeURIComponent(gameId)}`);
+    state.suggestions = [];
+    state.aiContext = null;
+    state.feedbackStatus = "Tidigare parti ateranslutet.";
+    state.lastFeedback = null;
+    applySnapshot(snapshot);
+    return true;
+  } catch (error) {
+    storeActiveGameId(null);
+    if (!String(error.message).includes("Unknown game_id")) {
+      throw error;
+    }
+    return false;
   }
-  const feedbackKey = `${state.snapshot.state_hash}:${actionKey(chosenAction)}`;
-  if (state.savedFeedbackKey === feedbackKey) {
+}
+
+async function saveCorrection(entry, { strength = "normal", appliesTo = "last_move", note = "human correction" } = {}) {
+  const key = feedbackKey(entry.stateHash, entry.chosenAction, strength, appliesTo);
+  if (state.savedFeedbackKeys.has(key)) {
     return;
   }
   const payload = await api("/ai/feedback", {
     method: "POST",
     body: JSON.stringify({
-      game_id: state.gameId,
-      state_hash: state.snapshot.state_hash,
-      ai_source: rankingSource(),
-      model_loaded: state.aiContext.modelLoaded,
-      model_eligible: state.aiContext.modelEligible,
-      recommended_action: topSuggestion,
-      chosen_action: chosenAction,
-      candidate_actions: state.aiContext.suggestions,
-      state_snapshot: state.snapshot,
+      game_id: entry.gameId,
+      state_hash: entry.stateHash,
+      ai_source: entry.aiSource,
+      model_loaded: entry.modelLoaded,
+      model_eligible: entry.modelEligible,
+      feedback_strength: strength,
+      applies_to: appliesTo,
+      recommended_action: entry.topSuggestion,
+      chosen_action: entry.chosenAction,
+      candidate_actions: entry.candidateActions,
+      state_snapshot: entry.stateSnapshot,
       note,
     }),
   });
-  state.feedbackStatus = `Korrigering sparad i ${payload.path}`;
-  state.savedFeedbackKey = feedbackKey;
+  state.savedFeedbackKeys.add(key);
+  state.feedbackStatus = `${FEEDBACK_LABELS[strength] || strength} sparad i ${payload.path}`;
+}
+
+async function saveCurrentPlannedFeedback(strength) {
+  const candidate = currentCorrectionCandidate();
+  if (!candidate) {
+    return;
+  }
+  await saveCorrection(candidate, {
+    strength,
+    appliesTo: "planned_move",
+    note: "planned human correction",
+  });
+  updateFeedbackPanel();
+}
+
+async function saveLastMoveFeedback(strength) {
+  if (!state.lastFeedback) {
+    return;
+  }
+  await saveCorrection(state.lastFeedback, {
+    strength,
+    appliesTo: "last_move",
+    note: "post-move human correction",
+  });
+  updateFeedbackPanel();
 }
 
 async function performMove(fromColumn, toColumn, runLength) {
   if (state.snapshot.status !== "in_progress") {
     return;
   }
+  let latestFeedback = null;
   if (state.aiContext && state.aiContext.stateHash === state.snapshot.state_hash) {
-    await saveCorrection(chosenMoveAction(fromColumn, toColumn, runLength));
+    const candidate = currentCorrectionCandidate();
+    if (candidate) {
+      await saveCorrection(candidate, {
+        strength: "normal",
+        appliesTo: "last_move",
+        note: "auto-captured human correction",
+      });
+      latestFeedback = candidate;
+    }
   }
   const snapshot = await api("/game/move", {
     method: "POST",
@@ -319,13 +550,33 @@ async function performMove(fromColumn, toColumn, runLength) {
   });
   state.suggestions = [];
   state.aiContext = null;
-  state.savedFeedbackKey = null;
+  state.lastFeedback = latestFeedback;
   applySnapshot(snapshot);
 }
 
 async function performDeal() {
-  if (state.aiContext && state.aiContext.stateHash === state.snapshot.state_hash) {
-    await saveCorrection({ type: "deal", description: `Deal from stock (${state.snapshot.stock_count} left)` }, "human chose deal");
+  let latestFeedback = null;
+  if (state.aiContext && state.aiContext.stateHash === state.snapshot.state_hash && state.aiContext.suggestions.length) {
+    const topSuggestion = state.aiContext.suggestions[0];
+    const chosenAction = dealAction();
+    if (actionKey(chosenAction) !== actionKey(topSuggestion)) {
+      latestFeedback = {
+        gameId: state.gameId,
+        stateHash: state.snapshot.state_hash,
+        stateSnapshot: state.snapshot,
+        aiSource: rankingSource(),
+        modelLoaded: state.aiContext.modelLoaded,
+        modelEligible: state.aiContext.modelEligible,
+        topSuggestion,
+        chosenAction,
+        candidateActions: state.aiContext.suggestions,
+      };
+      await saveCorrection(latestFeedback, {
+        strength: "normal",
+        appliesTo: "last_move",
+        note: "human chose deal",
+      });
+    }
   }
   const snapshot = await api("/game/deal", {
     method: "POST",
@@ -333,7 +584,7 @@ async function performDeal() {
   });
   state.suggestions = [];
   state.aiContext = null;
-  state.savedFeedbackKey = null;
+  state.lastFeedback = latestFeedback;
   applySnapshot(snapshot);
 }
 
@@ -344,7 +595,7 @@ async function performUndo() {
   });
   state.suggestions = [];
   state.aiContext = null;
-  state.savedFeedbackKey = null;
+  state.lastFeedback = null;
   applySnapshot(snapshot);
 }
 
@@ -355,43 +606,102 @@ async function performConcede() {
   });
   state.suggestions = [];
   state.aiContext = null;
-  state.savedFeedbackKey = null;
+  state.lastFeedback = null;
   applySnapshot(snapshot);
 }
 
-async function loadSuggestions() {
-  const payload = await api("/ai/evaluate-move", {
-    method: "POST",
-    body: JSON.stringify({ game_id: state.gameId }),
-  });
-  state.suggestions = payload.suggestions;
-  state.aiContext = {
-    stateHash: state.snapshot.state_hash,
-    suggestions: payload.suggestions,
-    modelLoaded: payload.model_loaded,
-    modelEligible: payload.model_eligible,
-  };
-  state.feedbackStatus = "";
-  state.savedFeedbackKey = null;
-  render();
-}
-
-async function saveSelectedCorrection() {
-  const candidate = currentCorrectionCandidate();
-  if (!candidate) {
+async function loadSuggestions({ silentIfCurrent = false } = {}) {
+  if (!state.snapshot || state.snapshot.status !== "in_progress") {
     return;
   }
-  await saveCorrection(candidate.chosenAction, "manual human correction");
+  if (silentIfCurrent && state.aiContext && state.aiContext.stateHash === state.snapshot.state_hash) {
+    return;
+  }
+
+  cancelPendingAiRequest();
+  const requestId = ++state.aiRequestId;
+  const targetStateHash = state.snapshot.state_hash;
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), AI_REQUEST_TIMEOUT_MS);
+  state.aiAbortController = controller;
+  state.aiLoading = true;
+  renderSuggestions();
+  updateFeedbackPanel();
+
+  try {
+    const payload = await api("/ai/evaluate-move", {
+      method: "POST",
+      body: JSON.stringify({ game_id: state.gameId }),
+      signal: controller.signal,
+    });
+    if (requestId !== state.aiRequestId || !state.snapshot || state.snapshot.state_hash !== targetStateHash) {
+      return;
+    }
+    state.aiLoading = false;
+    state.aiAbortController = null;
+    state.suggestions = payload.suggestions;
+    state.aiContext = {
+      stateHash: state.snapshot.state_hash,
+      suggestions: payload.suggestions,
+      modelLoaded: payload.model_loaded,
+      modelEligible: payload.model_eligible,
+    };
+    state.feedbackStatus = "";
+    render();
+  } catch (error) {
+    if (requestId === state.aiRequestId) {
+      state.aiLoading = false;
+      state.aiAbortController = null;
+      if (error.name === "AbortError") {
+        state.feedbackStatus = "AI-analysen tog for lang tid. Du kan fortsatta spela eller prova igen.";
+        renderSuggestions();
+      }
+      updateFeedbackPanel();
+    }
+    if (error.name === "AbortError") {
+      return;
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+}
+
+function handleAutoAiToggle() {
+  state.feedbackStatus = "";
+  if (!autoAiEnabled()) {
+    cancelPendingAiRequest();
+    renderSuggestions();
+  }
+  if (autoAiEnabled() && state.snapshot && state.snapshot.status === "in_progress") {
+    loadSuggestions({ silentIfCurrent: true }).catch((error) => {
+      state.feedbackStatus = error.message;
+      updateFeedbackPanel();
+    });
+  }
   updateFeedbackPanel();
 }
 
 document.getElementById("new-game").addEventListener("click", startNewGame);
 document.getElementById("deal").addEventListener("click", performDeal);
 document.getElementById("undo").addEventListener("click", performUndo);
-document.getElementById("suggest").addEventListener("click", loadSuggestions);
+document.getElementById("suggest").addEventListener("click", () => loadSuggestions());
 document.getElementById("concede").addEventListener("click", performConcede);
-document.getElementById("save-feedback").addEventListener("click", saveSelectedCorrection);
+document.getElementById("auto-ai").addEventListener("change", handleAutoAiToggle);
+document.getElementById("pending-normal").addEventListener("click", () => saveCurrentPlannedFeedback("normal"));
+document.getElementById("pending-important").addEventListener("click", () => saveCurrentPlannedFeedback("important"));
+document.getElementById("pending-key").addEventListener("click", () => saveCurrentPlannedFeedback("key_move"));
+document.getElementById("last-normal").addEventListener("click", () => saveLastMoveFeedback("normal"));
+document.getElementById("last-important").addEventListener("click", () => saveLastMoveFeedback("important"));
+document.getElementById("last-key").addEventListener("click", () => saveLastMoveFeedback("key_move"));
 
-startNewGame().catch((error) => {
+document.getElementById("status-text").textContent = "Laddar parti...";
+
+restoreStoredGame().then((restored) => {
+  if (restored) {
+    return;
+  }
+  return startNewGame();
+}).catch((error) => {
   document.getElementById("status-text").textContent = error.message;
 });
