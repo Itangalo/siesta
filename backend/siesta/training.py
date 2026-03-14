@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import json
 import random
+import shutil
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -30,6 +31,10 @@ MODELS_DIR.mkdir(parents=True, exist_ok=True)
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 DEFAULT_MODEL_PATH = MODELS_DIR / "policy-latest.npz"
 DEFAULT_METADATA_PATH = MODELS_DIR / "policy-latest.json"
+DEFAULT_CANDIDATE_MODEL_PATH = MODELS_DIR / "policy-candidate.npz"
+DEFAULT_CANDIDATE_METADATA_PATH = MODELS_DIR / "policy-candidate.json"
+DEFAULT_BEST_MODEL_PATH = MODELS_DIR / "policy-best.npz"
+DEFAULT_BEST_METADATA_PATH = MODELS_DIR / "policy-best.json"
 DEFAULT_FEEDBACK_PATH = DATA_DIR / "human_feedback.jsonl"
 DEFAULT_SEARCH_DEPTH = 2
 DEFAULT_SEARCH_BEAM_WIDTH = 4
@@ -47,6 +52,11 @@ DEFAULT_TEACHER_SEARCH_ROLLOUT_STEPS = 10
 DEFAULT_TEACHER_ALTERNATE_ACTIONS = 1
 DEFAULT_TEACHER_MAX_STATES_PER_GAME = 3
 DEFAULT_TEACHER_BRANCH_MARGIN = 10.0
+DEFAULT_GENERATED_TARGET_BOOST = 0.65
+DEFAULT_HUMAN_TARGET_BOOST = 0.82
+DEFAULT_EXACT_HUMAN_TARGET_BOOST = 0.9
+DEFAULT_HUMAN_TARGET_SHARE = 0.18
+DEFAULT_MAX_HUMAN_REPEAT_FACTOR = 32
 ProgressCallback = Optional[Callable[[str], None]]
 
 
@@ -76,6 +86,8 @@ class TrainingCase:
     chosen_signature: str
     action_signatures: List[str]
     soft_targets: np.ndarray
+    target_boost: float = DEFAULT_GENERATED_TARGET_BOOST
+    source: str = "generated"
 
 
 @dataclass
@@ -556,8 +568,8 @@ class NumpyPolicyNetwork:
                 shifted = logits - np.max(logits)
                 exp_logits = np.exp(np.clip(shifted, -30.0, 30.0))
                 probs = exp_logits / np.sum(exp_logits)
-                target_distribution = case.soft_targets * 0.35
-                target_distribution[case.target_index] += 0.65
+                target_distribution = case.soft_targets * (1.0 - case.target_boost)
+                target_distribution[case.target_index] += case.target_boost
                 loss = -np.sum(target_distribution * np.log(probs + 1e-8))
                 weighted_loss += case.weight * float(loss)
                 if int(np.argmax(probs)) == case.target_index:
@@ -751,6 +763,8 @@ def build_training_cases(
                         chosen_signature=chosen_signature,
                         action_signatures=signatures,
                         soft_targets=soft_targets,
+                        target_boost=DEFAULT_GENERATED_TARGET_BOOST,
+                        source="generated",
                     )
                 )
                 state = apply_action(state, chosen)
@@ -787,37 +801,49 @@ def train_policy_model(
     benchmark_games: int = 20,
     progress: ProgressCallback = None,
 ) -> Dict[str, Any]:
-    cases = build_training_cases(num_games=num_games, teacher_policy=teacher_policy, progress=progress)
+    generated_cases = build_training_cases(num_games=num_games, teacher_policy=teacher_policy, progress=progress)
     human_cases, human_feedback_summary = load_human_feedback_cases(progress=progress)
-    cases.extend(human_cases)
+    cases, human_repeat_factor = expand_human_cases_for_training(generated_cases, human_cases, progress=progress)
+    benchmark_seeds = list(range(benchmark_games))
+    active_model_before = load_latest_model()
+    active_metadata_before = load_model_metadata()
     model = NumpyPolicyNetwork(input_dim=cases[0].features.shape[1], hidden_dim=hidden_dim)
     emit_progress(
         progress,
         f"[train] starting ranked training on {len(cases)} decision states "
-        f"({len(human_cases)} human, {len(cases) - len(human_cases)} generated)",
+        f"({len(human_cases)} human raw, {len(generated_cases)} generated, "
+        f"{len(human_cases) * human_repeat_factor} human effective)",
     )
     metrics = model.train_ranked(cases, epochs=epochs, learning_rate=learning_rate, progress=progress)
-    model.save(DEFAULT_MODEL_PATH)
     emit_progress(progress, "[benchmark] evaluating heuristic")
     heuristic_eval = summarize_evaluation(
-        evaluate_policy(policy="heuristic", seeds=range(benchmark_games), progress=progress)
+        evaluate_policy(policy="heuristic", seeds=benchmark_seeds, progress=progress)
     )
     emit_progress(progress, "[benchmark] evaluating search")
     search_eval = summarize_evaluation(
-        evaluate_policy(policy="search", seeds=range(benchmark_games), progress=progress)
+        evaluate_policy(policy="search", seeds=benchmark_seeds, progress=progress)
     )
-    emit_progress(progress, "[benchmark] evaluating model")
-    model_eval = summarize_evaluation(
-        evaluate_policy(policy="model", seeds=range(benchmark_games), model=model, progress=progress)
+    emit_progress(progress, "[benchmark] evaluating candidate model")
+    candidate_eval = summarize_evaluation(
+        evaluate_policy(policy="model", seeds=benchmark_seeds, model=model, progress=progress)
     )
+    active_eval_before = None
+    if active_model_before is not None:
+        emit_progress(progress, "[benchmark] evaluating active model")
+        active_eval_before = summarize_evaluation(
+            evaluate_policy(policy="model", seeds=benchmark_seeds, model=active_model_before, progress=progress)
+        )
+
+    promoted_to_active = model_is_better(candidate_eval, active_eval_before)
+    active_eval = candidate_eval if promoted_to_active or active_eval_before is None else active_eval_before
     eligible_for_ui = (
-        model_eval["win_rate"] > heuristic_eval["win_rate"]
+        active_eval["win_rate"] > heuristic_eval["win_rate"]
         or (
-            model_eval["win_rate"] == heuristic_eval["win_rate"]
-            and model_eval["average_progress"] >= heuristic_eval["average_progress"]
+            active_eval["win_rate"] == heuristic_eval["win_rate"]
+            and active_eval["average_progress"] >= heuristic_eval["average_progress"]
         )
     )
-    metadata = {
+    candidate_metadata = {
         "num_games": num_games,
         "epochs": epochs,
         "learning_rate": learning_rate,
@@ -825,8 +851,10 @@ def train_policy_model(
         "teacher_policy": teacher_policy,
         "benchmark_games": benchmark_games,
         "training_cases": len(cases),
-        "generated_training_cases": len(cases) - len(human_cases),
+        "generated_training_cases": len(generated_cases),
         "human_feedback_cases": len(human_cases),
+        "effective_human_training_cases": len(human_cases) * human_repeat_factor,
+        "human_repeat_factor": human_repeat_factor,
         "human_feedback_records_seen": human_feedback_summary.records_seen,
         "human_feedback_unique_entries": human_feedback_summary.unique_entries,
         "human_feedback_inferred_stock_cases": human_feedback_summary.inferred_stock_cases,
@@ -838,11 +866,26 @@ def train_policy_model(
         "metrics": metrics,
         "heuristic_evaluation": heuristic_eval,
         "search_evaluation": search_eval,
-        "model_evaluation": model_eval,
+        "candidate_model_evaluation": candidate_eval,
+        "active_model_before_evaluation": active_eval_before,
+        "active_model_evaluation": active_eval,
+        "model_evaluation": active_eval,
+        "promoted_to_active": promoted_to_active,
+        "active_model_path": str(DEFAULT_MODEL_PATH),
         "eligible_for_ui": eligible_for_ui,
     }
-    DEFAULT_METADATA_PATH.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-    return {"model_path": str(DEFAULT_MODEL_PATH), **metadata}
+    save_candidate_checkpoint(model, candidate_metadata)
+    if promoted_to_active:
+        active_metadata = dict(candidate_metadata)
+        active_metadata["eligible_for_ui"] = eligible_for_ui
+        active_metadata["promoted_to_active"] = True
+        active_metadata["previous_active_metadata"] = active_metadata_before if active_metadata_before else None
+        promote_candidate_checkpoint(active_metadata)
+    return {
+        "model_path": str(DEFAULT_MODEL_PATH),
+        "candidate_model_path": str(DEFAULT_CANDIDATE_MODEL_PATH),
+        **candidate_metadata,
+    }
 
 
 def load_latest_model() -> Optional[NumpyPolicyNetwork]:
@@ -1204,11 +1247,70 @@ def reconstruct_feedback_state(snapshot: Dict[str, Any]) -> Tuple[GameState, boo
 
 def _feedback_strength_weight(strength: str) -> float:
     weights = {
-        "normal": 4.0,
-        "important": 7.0,
-        "key_move": 11.0,
+        "normal": 8.0,
+        "important": 14.0,
+        "key_move": 22.0,
     }
     return weights.get(strength, 4.0)
+
+
+def human_case_repeat_factor(
+    generated_count: int,
+    human_count: int,
+    target_share: float = DEFAULT_HUMAN_TARGET_SHARE,
+    max_repeat_factor: int = DEFAULT_MAX_HUMAN_REPEAT_FACTOR,
+) -> int:
+    if human_count <= 0:
+        return 1
+    if generated_count <= 0:
+        return 1
+    required = (target_share * generated_count) / max(1e-6, (1.0 - target_share) * human_count)
+    return max(1, min(max_repeat_factor, int(np.ceil(required))))
+
+
+def expand_human_cases_for_training(
+    generated_cases: Sequence[TrainingCase],
+    human_cases: Sequence[TrainingCase],
+    progress: ProgressCallback = None,
+) -> Tuple[List[TrainingCase], int]:
+    repeat_factor = human_case_repeat_factor(len(generated_cases), len(human_cases))
+    expanded_cases = list(generated_cases)
+    if human_cases:
+        expanded_cases.extend(list(human_cases) * repeat_factor)
+    emit_progress(
+        progress,
+        f"[feedback] effective human repeat factor={repeat_factor} "
+        f"(generated={len(generated_cases)}, human={len(human_cases)}, total={len(expanded_cases)})",
+    )
+    return expanded_cases, repeat_factor
+
+
+def model_is_better(candidate_eval: Dict[str, Any], reference_eval: Optional[Dict[str, Any]]) -> bool:
+    if not reference_eval:
+        return True
+    candidate_key = (
+        float(candidate_eval.get("win_rate", 0.0)),
+        float(candidate_eval.get("average_progress", 0.0)),
+        float(candidate_eval.get("average_completed_sequences", 0.0)),
+    )
+    reference_key = (
+        float(reference_eval.get("win_rate", 0.0)),
+        float(reference_eval.get("average_progress", 0.0)),
+        float(reference_eval.get("average_completed_sequences", 0.0)),
+    )
+    return candidate_key > reference_key
+
+
+def save_candidate_checkpoint(model: "NumpyPolicyNetwork", metadata: Dict[str, Any]) -> None:
+    model.save(DEFAULT_CANDIDATE_MODEL_PATH)
+    DEFAULT_CANDIDATE_METADATA_PATH.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+
+def promote_candidate_checkpoint(candidate_metadata: Dict[str, Any]) -> None:
+    shutil.copyfile(DEFAULT_CANDIDATE_MODEL_PATH, DEFAULT_MODEL_PATH)
+    DEFAULT_METADATA_PATH.write_text(json.dumps(candidate_metadata, indent=2), encoding="utf-8")
+    shutil.copyfile(DEFAULT_CANDIDATE_MODEL_PATH, DEFAULT_BEST_MODEL_PATH)
+    DEFAULT_BEST_METADATA_PATH.write_text(json.dumps(candidate_metadata, indent=2), encoding="utf-8")
 
 
 def _dedupe_feedback_records(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1298,6 +1400,8 @@ def load_human_feedback_cases(
                 chosen_signature=chosen_signature,
                 action_signatures=signatures,
                 soft_targets=soft_targets,
+                target_boost=DEFAULT_EXACT_HUMAN_TARGET_BOOST if exact_stock else DEFAULT_HUMAN_TARGET_BOOST,
+                source="human",
             )
         )
 
