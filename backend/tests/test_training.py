@@ -19,6 +19,7 @@ from backend.siesta.training import (
     human_case_repeat_factor,
     load_human_feedback_cases,
     rank_actions_for_state,
+    training_game_seeds,
     top_color_mix_penalty,
 )
 
@@ -60,6 +61,14 @@ def test_search_teacher_generates_training_examples():
     assert len(features) == len(labels)
     assert features.shape[1] > 0
     assert labels.sum() > 0
+
+
+def test_training_game_seeds_are_deterministic_but_not_sequential():
+    seeds_a = training_game_seeds(6, seed_offset=0)
+    seeds_b = training_game_seeds(6, seed_offset=0)
+    assert seeds_a == seeds_b
+    assert len(set(seeds_a)) == len(seeds_a)
+    assert seeds_a != list(range(6))
 
 
 def test_training_cases_capture_ranked_choice():

@@ -804,6 +804,19 @@ def build_training_examples(
     return np.vstack(examples), np.asarray(labels, dtype=np.float32)
 
 
+def training_game_seeds(num_games: int, seed_offset: int = 0) -> List[int]:
+    rng = random.Random(17 + seed_offset)
+    seeds: List[int] = []
+    seen = set()
+    while len(seeds) < num_games:
+        candidate = rng.randrange(1_000_000_000)
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        seeds.append(candidate)
+    return seeds
+
+
 def build_training_cases(
     num_games: int = 60,
     max_moves: int = 180,
@@ -822,10 +835,11 @@ def build_training_cases(
 ) -> List[TrainingCase]:
     cases: List[TrainingCase] = []
     rng = random.Random(17 + seed_offset)
+    game_seeds = training_game_seeds(num_games=num_games, seed_offset=seed_offset)
     progress_every = max(1, num_games // 10)
     emit_progress(progress, f"[data] generating training cases from {num_games} games using {teacher_policy}")
 
-    for game_seed in range(seed_offset, seed_offset + num_games):
+    for game_index, game_seed in enumerate(game_seeds, start=1):
         state_queue: List[GameState] = [create_game(seed=game_seed)]
         queued_hashes = {state_queue[0].state_hash}
         explored_states = 0
@@ -835,7 +849,9 @@ def build_training_cases(
             explored_states += 1
             emit_progress(
                 progress,
-                f"[data] seed={game_seed} exploring branch {explored_states}/{max_states_per_game} queue={len(state_queue)}",
+                "[data] "
+                f"game={game_index}/{num_games} deal_seed={game_seed} "
+                f"exploring branch {explored_states}/{max_states_per_game} queue={len(state_queue)}",
             )
             repeated_states: Dict[str, int] = {}
             best_progress = progress_score(state)
@@ -919,7 +935,7 @@ def build_training_cases(
                 if repeated_states[state.state_hash] >= repeat_limit or moves_since_progress >= stagnation_limit:
                     state = terminate_for_training(state, "stagnation")
                     break
-        completed = game_seed - seed_offset + 1
+        completed = game_index
         if completed % progress_every == 0 or completed == num_games:
             emit_progress(
                 progress,
@@ -1086,6 +1102,7 @@ def play_episode(
     stagnation_limit: int = 30,
     repeat_limit: int = 3,
     progress: ProgressCallback = None,
+    progress_label: Optional[str] = None,
     search_depth: int = DEFAULT_SEARCH_DEPTH,
     search_beam_width: int = DEFAULT_SEARCH_BEAM_WIDTH,
     search_discount: float = DEFAULT_SEARCH_DISCOUNT,
@@ -1133,7 +1150,8 @@ def play_episode(
             state = terminate_for_training(state, "stagnation")
             break
 
-    emit_progress(progress, f"[eval:{policy}] seed={seed} progress={progress_score(state)} status={state.status}")
+    label = f"{progress_label} " if progress_label else ""
+    emit_progress(progress, f"[eval:{policy}] {label}seed={seed} progress={progress_score(state)} status={state.status}")
 
     return {
         "seed": seed,
@@ -1180,6 +1198,7 @@ def evaluate_policy(
                 seed=seed,
                 model=model,
                 progress=progress,
+                progress_label=f"game={index}/{len(seeds)}",
                 search_depth=search_depth,
                 search_beam_width=search_beam_width,
                 search_discount=search_discount,
@@ -1385,7 +1404,7 @@ def reconstruct_feedback_state(snapshot: Dict[str, Any]) -> Tuple[GameState, boo
 
 def _feedback_strength_weight(strength: str) -> float:
     weights = {
-        "normal": 5.0,
+        "normal": 3.5,
         "important": 18.0,
         "key_move": 36.0,
     }
