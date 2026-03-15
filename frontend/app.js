@@ -204,29 +204,27 @@ function dealAction() {
   return { type: "deal", description: `Deal from stock (${state.snapshot.stock_count} left)` };
 }
 
-function currentCorrectionCandidate() {
-  if (!state.aiContext || !state.aiContext.suggestions.length) {
-    return null;
-  }
-  if (!state.selection || state.selectionTarget === null) {
-    return null;
-  }
-  const chosenAction = chosenMoveAction(state.selection.fromColumn, state.selectionTarget, state.selection.runLength);
-  const topSuggestion = state.aiContext.suggestions[0];
-  if (actionKey(chosenAction) === actionKey(topSuggestion)) {
-    return null;
-  }
+function buildFeedbackEntry(chosenAction) {
+  const topSuggestion = state.aiContext && state.aiContext.suggestions.length ? state.aiContext.suggestions[0] : null;
   return {
     gameId: state.gameId,
     stateHash: state.snapshot.state_hash,
     stateSnapshot: state.snapshot,
-    aiSource: rankingSource(),
-    modelLoaded: state.aiContext.modelLoaded,
-    modelEligible: state.aiContext.modelEligible,
+    aiSource: state.aiContext ? rankingSource() : "none",
+    modelLoaded: state.aiContext ? state.aiContext.modelLoaded : false,
+    modelEligible: state.aiContext ? state.aiContext.modelEligible : false,
     topSuggestion,
     chosenAction,
-    candidateActions: state.aiContext.suggestions,
+    candidateActions: state.aiContext ? state.aiContext.suggestions : [],
   };
+}
+
+function currentPlannedFeedbackEntry() {
+  if (!state.selection || state.selectionTarget === null) {
+    return null;
+  }
+  const chosenAction = chosenMoveAction(state.selection.fromColumn, state.selectionTarget, state.selection.runLength);
+  return buildFeedbackEntry(chosenAction);
 }
 
 function updateFeedbackPanel() {
@@ -260,8 +258,8 @@ function updateFeedbackPanel() {
     const modelPart = top.model_score === null || top.model_score === undefined ? "" : ` | modell ${top.model_score.toFixed(2)}`;
     summary.textContent = `Aktiv AI-källa: ${source}. Toppförslag: ${top.description}${searchPart}${modelPart}.`;
 
-    const candidate = currentCorrectionCandidate();
-    if (!candidate) {
+    const candidate = currentPlannedFeedbackEntry();
+    if (!candidate || !candidate.topSuggestion || actionKey(candidate.chosenAction) === actionKey(candidate.topSuggestion)) {
       pendingPanel.classList.add("hidden");
       pendingText.textContent = "";
     } else {
@@ -277,7 +275,15 @@ function updateFeedbackPanel() {
   }
 
   lastPanel.classList.remove("hidden");
-  lastText.textContent = `Senaste egna drag: ${state.lastFeedback.chosenAction.description}. AI:s toppförslag var ${state.lastFeedback.topSuggestion.description}. Markera här om draget du just gjorde bör väga extra tungt i träningen.`;
+  if (!state.lastFeedback.topSuggestion) {
+    lastText.textContent = `Senaste egna drag: ${state.lastFeedback.chosenAction.description}. Draget är redan sparat som träningsdata. Markera här om det bör väga extra tungt i träningen.`;
+    return;
+  }
+  if (actionKey(state.lastFeedback.chosenAction) === actionKey(state.lastFeedback.topSuggestion)) {
+    lastText.textContent = `Senaste egna drag: ${state.lastFeedback.chosenAction.description}. Det matchade AI:ns toppförslag ${state.lastFeedback.topSuggestion.description}. Markera här om draget var särskilt viktigt eller genomtänkt.`;
+    return;
+  }
+  lastText.textContent = `Senaste egna drag: ${state.lastFeedback.chosenAction.description}. AI:s toppförslag var ${state.lastFeedback.topSuggestion.description}. Draget är redan sparat; markera här om det bör väga extra tungt i träningen.`;
 }
 
 function updateStatus() {
@@ -589,7 +595,7 @@ async function saveCorrection(entry, { strength = "normal", appliesTo = "last_mo
 }
 
 async function saveCurrentPlannedFeedback(strength) {
-  const candidate = currentCorrectionCandidate();
+  const candidate = currentPlannedFeedbackEntry();
   if (!candidate) {
     return;
   }
@@ -617,18 +623,7 @@ async function performMove(fromColumn, toColumn, runLength) {
   if (state.snapshot.status !== "in_progress") {
     return;
   }
-  let latestFeedback = null;
-  if (state.aiContext && state.aiContext.stateHash === state.snapshot.state_hash) {
-    const candidate = currentCorrectionCandidate();
-    if (candidate) {
-      await saveCorrection(candidate, {
-        strength: "normal",
-        appliesTo: "last_move",
-        note: "auto-captured human correction",
-      });
-      latestFeedback = candidate;
-    }
-  }
+  const latestFeedback = buildFeedbackEntry(chosenMoveAction(fromColumn, toColumn, runLength));
   const snapshot = await api("/game/move", {
     method: "POST",
     body: JSON.stringify({
@@ -642,32 +637,18 @@ async function performMove(fromColumn, toColumn, runLength) {
   state.aiContext = null;
   state.lastFeedback = latestFeedback;
   applySnapshot(snapshot);
+  saveCorrection(latestFeedback, {
+    strength: "normal",
+    appliesTo: "last_move",
+    note: "auto-saved human move",
+  }).catch((error) => {
+    state.feedbackStatus = error.message;
+    updateFeedbackPanel();
+  });
 }
 
 async function performDeal() {
-  let latestFeedback = null;
-  if (state.aiContext && state.aiContext.stateHash === state.snapshot.state_hash && state.aiContext.suggestions.length) {
-    const topSuggestion = state.aiContext.suggestions[0];
-    const chosenAction = dealAction();
-    if (actionKey(chosenAction) !== actionKey(topSuggestion)) {
-      latestFeedback = {
-        gameId: state.gameId,
-        stateHash: state.snapshot.state_hash,
-        stateSnapshot: state.snapshot,
-        aiSource: rankingSource(),
-        modelLoaded: state.aiContext.modelLoaded,
-        modelEligible: state.aiContext.modelEligible,
-        topSuggestion,
-        chosenAction,
-        candidateActions: state.aiContext.suggestions,
-      };
-      await saveCorrection(latestFeedback, {
-        strength: "normal",
-        appliesTo: "last_move",
-        note: "human chose deal",
-      });
-    }
-  }
+  const latestFeedback = buildFeedbackEntry(dealAction());
   const snapshot = await api("/game/deal", {
     method: "POST",
     body: JSON.stringify({ game_id: state.gameId }),
@@ -676,6 +657,14 @@ async function performDeal() {
   state.aiContext = null;
   state.lastFeedback = latestFeedback;
   applySnapshot(snapshot);
+  saveCorrection(latestFeedback, {
+    strength: "normal",
+    appliesTo: "last_move",
+    note: "auto-saved human deal",
+  }).catch((error) => {
+    state.feedbackStatus = error.message;
+    updateFeedbackPanel();
+  });
 }
 
 async function performUndo() {

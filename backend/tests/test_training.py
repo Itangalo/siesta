@@ -8,15 +8,18 @@ from backend.siesta.training import (
     HumanFeedbackSummary,
     NumpyPolicyNetwork,
     TrainingCase,
+    blocked_mid_rank_risk,
     benchmark_policies,
     build_training_cases,
     build_training_examples,
     choose_search_action,
     expand_human_cases_for_training,
     evaluate_policy,
+    hole_access_score,
     human_case_repeat_factor,
     load_human_feedback_cases,
     rank_actions_for_state,
+    top_color_mix_penalty,
 )
 
 
@@ -107,9 +110,9 @@ def test_search_prefers_creating_hole_when_available():
             [Card(7, "spades")],
             [Card(5, "clubs"), Card(4, "clubs")],
             [Card(5, "diamonds")],
-            [],
-            [],
-            [],
+            [Card(8, "spades")],
+            [Card(9, "hearts")],
+            [Card(10, "clubs")],
         ]
     )
     action = choose_search_action(state)
@@ -117,6 +120,73 @@ def test_search_prefers_creating_hole_when_available():
     assert action.move is not None
     source_height = len(state.columns[action.move.from_column])
     assert action.move.run_length == source_height
+
+
+def test_blocked_mid_rank_risk_penalizes_buried_middle_duplicates():
+    risky = make_state(
+        [
+            [Card(9, "hearts"), Card(7, "hearts"), Card(7, "spades"), Card(7, "clubs"), Card(6, "clubs")],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+        ]
+    )
+    safe = make_state(
+        [
+            [Card(9, "hearts"), Card(4, "spades"), Card(3, "spades")],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+        ]
+    )
+    assert blocked_mid_rank_risk(risky) > blocked_mid_rank_risk(safe)
+
+
+def test_hole_access_score_rewards_states_near_creating_hole():
+    state = make_state(
+        [
+            [Card(6, "hearts")],
+            [Card(7, "spades")],
+            [Card(8, "clubs"), Card(7, "clubs")],
+            [],
+            [],
+            [],
+            [],
+        ]
+    )
+    assert hole_access_score(state) > 0.0
+
+
+def test_color_mix_penalty_grows_with_more_mixed_suits():
+    two_suit_mix = make_state(
+        [
+            [Card(8, "spades"), Card(7, "hearts"), Card(6, "spades")],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+        ]
+    )
+    four_suit_mix = make_state(
+        [
+            [Card(8, "spades"), Card(7, "hearts"), Card(6, "clubs"), Card(5, "diamonds")],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+        ]
+    )
+    assert top_color_mix_penalty(four_suit_mix) > top_color_mix_penalty(two_suit_mix)
 
 
 def test_ui_ranking_returns_compact_suggestions():
@@ -183,6 +253,67 @@ def test_load_human_feedback_cases_uses_strongest_duplicate(tmp_path):
     assert cases[0].weight >= 14.0
     assert cases[0].target_boost >= 0.9
     assert cases[0].source == "human"
+
+
+def test_load_human_feedback_cases_skips_invalidated_entries(tmp_path):
+    state_snapshot = {
+        "status": "in_progress",
+        "terminal_reason": None,
+        "moves_played": 0,
+        "stock_count": 0,
+        "completed_sequences": 0,
+        "state_hash": "demo",
+        "columns": [
+            {"index": 0, "cards": [{"rank": 6, "suit": "hearts"}], "movable_run_length": 1, "height": 1},
+            {"index": 1, "cards": [{"rank": 7, "suit": "spades"}], "movable_run_length": 1, "height": 1},
+            {"index": 2, "cards": [], "movable_run_length": 0, "height": 0},
+            {"index": 3, "cards": [], "movable_run_length": 0, "height": 0},
+            {"index": 4, "cards": [], "movable_run_length": 0, "height": 0},
+            {"index": 5, "cards": [], "movable_run_length": 0, "height": 0},
+            {"index": 6, "cards": [], "movable_run_length": 0, "height": 0},
+        ],
+        "stock_cards": [],
+    }
+    chosen_action = {"type": "move", "from_column": 0, "to_column": 1, "run_length": 1}
+    feedback_key = json.dumps(
+        {
+            "state_hash": "demo",
+            "chosen_action": {
+                "type": "move",
+                "from_column": 0,
+                "to_column": 1,
+                "run_length": 1,
+                "description": None,
+            },
+        },
+        sort_keys=True,
+    )
+    rows = [
+        {
+            "record_type": "feedback",
+            "timestamp": "2026-03-14T10:00:00+00:00",
+            "state_hash": "demo",
+            "feedback_strength": "key_move",
+            "chosen_action": chosen_action,
+            "state_snapshot": state_snapshot,
+            "feedback_key": feedback_key,
+        },
+        {
+            "record_type": "invalidation",
+            "timestamp": "2026-03-14T10:00:01+00:00",
+            "state_hash": "demo",
+            "chosen_action": chosen_action,
+            "feedback_key": feedback_key,
+        },
+    ]
+    path = tmp_path / "human_feedback.jsonl"
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    cases, summary = load_human_feedback_cases(path=path)
+    assert len(cases) == 0
+    assert summary.records_seen == 2
+    assert summary.invalidated_entries == 1
+    assert summary.unique_entries == 0
 
 
 def test_human_cases_are_repeated_to_gain_training_share():

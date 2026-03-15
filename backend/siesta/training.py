@@ -98,6 +98,7 @@ class HumanFeedbackSummary:
     skipped_missing_state: int = 0
     skipped_missing_action: int = 0
     inferred_stock_cases: int = 0
+    invalidated_entries: int = 0
 
 
 def emit_progress(progress: ProgressCallback, message: str) -> None:
@@ -140,6 +141,20 @@ def total_run_depth(state: GameState) -> int:
     return sum(top_run_length(column) for column in state.columns if column)
 
 
+def top_stair_length(column: Sequence[Card]) -> int:
+    if not column:
+        return 0
+    run = 1
+    for index in range(len(column) - 1, 0, -1):
+        upper = column[index]
+        lower = column[index - 1]
+        if lower.rank == upper.rank + 1:
+            run += 1
+        else:
+            break
+    return run
+
+
 def empty_column_count(state: GameState) -> int:
     return sum(1 for column in state.columns if not column)
 
@@ -169,6 +184,79 @@ def mobility_score(state: GameState) -> float:
     return float(run_total + distinct_targets)
 
 
+def hole_access_score(state: GameState) -> float:
+    actions = legal_moves(state)
+    if not actions:
+        return 0.0
+    best_remaining_by_column: Dict[int, int] = {}
+    for move in actions:
+        remaining = len(state.columns[move.from_column]) - move.run_length
+        current = best_remaining_by_column.get(move.from_column)
+        if current is None or remaining < current:
+            best_remaining_by_column[move.from_column] = remaining
+
+    score = 0.0
+    for remaining in best_remaining_by_column.values():
+        if remaining == 0:
+            score += 6.0
+        elif remaining == 1:
+            score += 2.5
+        elif remaining == 2:
+            score += 0.75
+    return score
+
+
+def top_color_mix_penalty(state: GameState) -> float:
+    penalty = 0.0
+    for column in state.columns:
+        stair_length = top_stair_length(column)
+        if stair_length < 2:
+            continue
+        suits = {card.suit for card in column[-stair_length:]}
+        penalty += max(0, len(suits) - 1) * max(0, stair_length - 1)
+    return penalty
+
+
+def _rank_block_weight(rank: int) -> float:
+    if rank in {1, 13}:
+        return 0.0
+    if rank in {2, 12}:
+        return 0.35
+    if rank == 11:
+        return 0.8
+    return 1.0
+
+
+def blocked_mid_rank_risk(state: GameState) -> float:
+    rank_counts: Dict[int, int] = {}
+    risk = 0.0
+
+    for column in state.columns:
+        movable_suffix = top_run_length(column)
+        buried_cards = column[:-movable_suffix] if movable_suffix else list(column)
+        local_counts: Dict[int, int] = {}
+        for index, card in enumerate(buried_cards):
+            depth_from_top = len(column) - 1 - index
+            if depth_from_top < 2:
+                continue
+            weight = _rank_block_weight(card.rank)
+            if weight <= 0.0:
+                continue
+            rank_counts[card.rank] = rank_counts.get(card.rank, 0) + 1
+            local_counts[card.rank] = local_counts.get(card.rank, 0) + 1
+            risk += weight * min(4.0, depth_from_top - 1) * 0.45
+
+        for rank, count in local_counts.items():
+            if count >= 2:
+                risk += _rank_block_weight(rank) * (count - 1) * 2.8
+
+    for rank, count in rank_counts.items():
+        if count >= 3:
+            risk += _rank_block_weight(rank) * (count - 2) * 3.6
+
+    return risk
+
+
 def move_creates_hole(state: GameState, action: Action) -> bool:
     if action.type != "move" or action.move is None:
         return False
@@ -189,40 +277,73 @@ def hole_bonus(empty_columns: int) -> float:
 def evaluate_action(state: GameState, action: Action) -> float:
     next_state = apply_action(state, action)
     score = 0.0
-    score += 250.0 if next_state.status == "won" else 0.0
-    score += 80.0 * (next_state.completed_sequences - state.completed_sequences)
-    score += 7.0 * run_depth(next_state)
     before_empty = empty_column_count(state)
     after_empty = empty_column_count(next_state)
+    before_hole_setup = hole_setup_score(state)
+    after_hole_setup = hole_setup_score(next_state)
+    before_hole_access = hole_access_score(state)
+    after_hole_access = hole_access_score(next_state)
+    before_blocked_risk = blocked_mid_rank_risk(state)
+    after_blocked_risk = blocked_mid_rank_risk(next_state)
+    before_mix_penalty = top_color_mix_penalty(state)
+    after_mix_penalty = top_color_mix_penalty(next_state)
+    before_run_depth = run_depth(state)
+    after_run_depth = run_depth(next_state)
+    before_total_run_depth = total_run_depth(state)
+    after_total_run_depth = total_run_depth(next_state)
+
+    score += 250.0 if next_state.status == "won" else 0.0
+    score += 80.0 * (next_state.completed_sequences - state.completed_sequences)
+    score += 3.0 * (after_run_depth - before_run_depth)
+    score += 1.5 * (after_total_run_depth - before_total_run_depth)
     score += hole_bonus(after_empty)
-    score -= hole_bonus(before_empty) * 0.4
-    score += 5.0 * hole_setup_score(next_state)
-    score -= 2.0 * len(next_state.stock)
+    score -= hole_bonus(before_empty) * 0.6
+    score += 6.0 * (after_hole_setup - before_hole_setup)
+    score += 7.0 * (after_hole_access - before_hole_access)
+    score += 2.2 * (before_blocked_risk - after_blocked_risk)
+    score += 0.22 * (before_mix_penalty - after_mix_penalty)
+    score -= 0.45 * len(next_state.stock)
     if action.type == "move" and action.move:
         moved = state.columns[action.move.from_column][-action.move.run_length :]
-        score += 4.0 * action.move.run_length
+        score += 2.0 * action.move.run_length
         destination = state.columns[action.move.to_column][-1] if state.columns[action.move.to_column] else None
         if destination and destination.suit == moved[0].suit:
-            score += 10.0
+            score += 4.0
         if move_creates_hole(state, action):
-            score += 25.0
+            if before_empty == 0:
+                score += 46.0
+            elif before_empty == 1:
+                score += 58.0
+            else:
+                score += 24.0
             if after_empty >= 2:
                 score += 18.0
+        remaining_source = len(state.columns[action.move.from_column]) - action.move.run_length
+        if remaining_source == 1:
+            score += 5.0
+        elif remaining_source == 2:
+            score += 1.5
     if action.type == "deal":
-        score += 6.0 if not legal_moves(state) else -5.0
+        score += 4.0 if not legal_moves(state) else -6.0
+        if before_empty > 0:
+            score -= 4.0
     return score
 
 
 def evaluate_state_snapshot(state: GameState) -> float:
     score = 0.0
+    empty_columns = empty_column_count(state)
     score += 400.0 if state.status == "won" else 0.0
     score += 90.0 * state.completed_sequences
-    score += 9.0 * run_depth(state)
-    score += 3.5 * total_run_depth(state)
-    score += hole_bonus(empty_column_count(state))
-    score += 4.0 * hole_setup_score(state)
+    score += 3.5 * run_depth(state)
+    score += 1.25 * total_run_depth(state)
+    score += hole_bonus(empty_columns)
+    score += 5.0 * hole_setup_score(state)
+    score += 5.5 * hole_access_score(state)
     score += 1.2 * mobility_score(state)
-    score -= 1.5 * len(state.stock)
+    score -= 2.4 * blocked_mid_rank_risk(state)
+    score -= 0.3 * top_color_mix_penalty(state)
+    score -= 0.35 * len(state.stock)
     return score
 
 
@@ -434,6 +555,9 @@ def global_state_features(state: GameState) -> np.ndarray:
             state.completed_sequences / 4.0,
             progress_score(state) / 52.0,
             state.moves_played / 200.0,
+            hole_access_score(state) / 24.0,
+            blocked_mid_rank_risk(state) / 40.0,
+            top_color_mix_penalty(state) / 20.0,
         ]
     )
     return np.asarray(features, dtype=np.float32)
@@ -478,15 +602,25 @@ def action_outcome_features(state: GameState, action: Action) -> np.ndarray:
     after_empty = empty_column_count(next_state)
     before_mobility = mobility_score(state)
     after_mobility = mobility_score(next_state)
+    before_hole_access = hole_access_score(state)
+    after_hole_access = hole_access_score(next_state)
+    before_blocked_risk = blocked_mid_rank_risk(state)
+    after_blocked_risk = blocked_mid_rank_risk(next_state)
+    before_mix_penalty = top_color_mix_penalty(state)
+    after_mix_penalty = top_color_mix_penalty(next_state)
     features = [
         next_state.completed_sequences / 4.0,
         run_depth(next_state) / 13.0,
         total_run_depth(next_state) / 52.0,
         after_empty / 7.0,
         hole_setup_score(next_state) / 20.0,
+        after_hole_access / 24.0,
         after_mobility / 30.0,
         (after_empty - before_empty) / 3.0,
+        (after_hole_access - before_hole_access) / 12.0,
         (after_mobility - before_mobility) / 30.0,
+        (before_blocked_risk - after_blocked_risk) / 20.0,
+        (before_mix_penalty - after_mix_penalty) / 12.0,
         1.0 if move_creates_hole(state, action) else 0.0,
         1.0 if after_empty >= 2 else 0.0,
         len(next_state.stock) / 24.0,
@@ -1313,6 +1447,44 @@ def promote_candidate_checkpoint(candidate_metadata: Dict[str, Any]) -> None:
     DEFAULT_BEST_METADATA_PATH.write_text(json.dumps(candidate_metadata, indent=2), encoding="utf-8")
 
 
+def _feedback_record_key(record: Dict[str, Any]) -> str:
+    existing = record.get("feedback_key")
+    if existing:
+        return str(existing)
+    chosen_action = record.get("chosen_action", {})
+    return json.dumps(
+        {
+            "state_hash": str(record.get("state_hash", "")),
+            "chosen_action": {
+                "type": chosen_action.get("type"),
+                "from_column": chosen_action.get("from_column"),
+                "to_column": chosen_action.get("to_column"),
+                "run_length": chosen_action.get("run_length"),
+                "description": chosen_action.get("description"),
+            },
+        },
+        sort_keys=True,
+    )
+
+
+def _filter_invalidated_feedback_records(records: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
+    invalidated_keys = {
+        str(record.get("feedback_key", ""))
+        for record in records
+        if str(record.get("record_type", "feedback")) == "invalidation"
+    }
+    filtered = []
+    invalidated_count = 0
+    for record in records:
+        if str(record.get("record_type", "feedback")) != "feedback":
+            continue
+        if _feedback_record_key(record) in invalidated_keys:
+            invalidated_count += 1
+            continue
+        filtered.append(record)
+    return filtered, invalidated_count
+
+
 def _dedupe_feedback_records(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     strength_rank = {"normal": 0, "important": 1, "key_move": 2}
     deduped: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -1356,7 +1528,9 @@ def load_human_feedback_cases(
 
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     summary.records_seen = len(rows)
-    deduped_rows = _dedupe_feedback_records(rows)
+    filtered_rows, invalidated_count = _filter_invalidated_feedback_records(rows)
+    summary.invalidated_entries = invalidated_count
+    deduped_rows = _dedupe_feedback_records(filtered_rows)
     summary.unique_entries = len(deduped_rows)
 
     cases: List[TrainingCase] = []
@@ -1410,7 +1584,8 @@ def load_human_feedback_cases(
         progress,
         "[feedback] loaded "
         f"{summary.cases_loaded}/{summary.unique_entries} human cases "
-        f"(records={summary.records_seen}, inferred_stock={summary.inferred_stock_cases}, "
+        f"(records={summary.records_seen}, invalidated={summary.invalidated_entries}, "
+        f"inferred_stock={summary.inferred_stock_cases}, "
         f"skipped_missing_state={summary.skipped_missing_state}, skipped_missing_action={summary.skipped_missing_action})",
     )
     return cases, summary

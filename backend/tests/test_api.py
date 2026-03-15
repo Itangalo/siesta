@@ -104,3 +104,70 @@ def test_feedback_endpoint_saves_human_correction(tmp_path, monkeypatch):
     assert saved["applies_to"] == "planned_move"
     assert "stock_cards" in saved["state_snapshot"]
     assert len(saved["state_snapshot"]["stock_cards"]) == saved["state_snapshot"]["stock_count"]
+
+
+def test_feedback_endpoint_allows_move_logging_without_ai_context(tmp_path, monkeypatch):
+    monkeypatch.setattr(api_module, "FEEDBACK_LOG_PATH", tmp_path / "human_feedback.jsonl")
+    monkeypatch.setattr(api_module, "DATA_DIR", tmp_path)
+
+    response = client.post("/game/new", json={"seed": 10})
+    snapshot = response.json()
+    game_id = snapshot["game_id"]
+
+    feedback = client.post(
+        "/ai/feedback",
+        json={
+            "game_id": game_id,
+            "state_hash": snapshot["state_hash"],
+            "feedback_strength": "normal",
+            "applies_to": "last_move",
+            "chosen_action": {"type": "deal", "description": "Deal from stock"},
+            "candidate_actions": [],
+            "state_snapshot": snapshot,
+            "note": "auto-saved human move",
+        },
+    )
+    assert feedback.status_code == 200
+    saved = json.loads((tmp_path / "human_feedback.jsonl").read_text(encoding="utf-8").strip())
+    assert saved["ai_source"] == "none"
+    assert saved["recommended_action"] is None
+    assert saved["chosen_action"]["type"] == "deal"
+
+
+def test_undo_appends_feedback_invalidation_for_last_action(tmp_path, monkeypatch):
+    monkeypatch.setattr(api_module, "FEEDBACK_LOG_PATH", tmp_path / "human_feedback.jsonl")
+    monkeypatch.setattr(api_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(api_module, "store", api_module.SessionStore(storage_dir=tmp_path / "sessions"))
+
+    response = client.post("/game/new", json={"seed": 12})
+    snapshot = response.json()
+    game_id = snapshot["game_id"]
+
+    client.post(
+        "/ai/feedback",
+        json={
+            "game_id": game_id,
+            "state_hash": snapshot["state_hash"],
+            "feedback_strength": "normal",
+            "applies_to": "last_move",
+            "chosen_action": {"type": "deal", "description": f"Deal from stock ({snapshot['stock_count']} left)"},
+            "candidate_actions": [],
+            "state_snapshot": snapshot,
+            "note": "auto-saved human deal",
+        },
+    )
+    undo_target = client.post("/game/deal", json={"game_id": game_id})
+    assert undo_target.status_code == 200
+
+    undone = client.post("/game/undo", json={"game_id": game_id})
+    assert undone.status_code == 200
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "human_feedback.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(rows) == 2
+    assert rows[-1]["record_type"] == "invalidation"
+    assert rows[-1]["state_hash"] == snapshot["state_hash"]
+    assert rows[-1]["chosen_action"]["type"] == "deal"

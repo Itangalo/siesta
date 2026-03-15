@@ -41,6 +41,7 @@ SESSIONS_DIR = DATA_DIR / "sessions"
 class GameSession:
     game_id: str
     history: List[GameState] = field(default_factory=list)
+    actions: List[Optional[Dict[str, Any]]] = field(default_factory=list)
 
     @property
     def state(self) -> GameState:
@@ -60,6 +61,7 @@ class SessionStore:
         payload = {
             "game_id": session.game_id,
             "history": [_serialize_game_state(state) for state in session.history],
+            "actions": session.actions,
         }
         self._session_path(session.game_id).write_text(json.dumps(payload), encoding="utf-8")
 
@@ -68,16 +70,23 @@ class SessionStore:
         if not path.exists():
             raise KeyError(game_id)
         payload = json.loads(path.read_text(encoding="utf-8"))
+        raw_actions = payload.get("actions", [])
         session = GameSession(
             game_id=payload["game_id"],
             history=[_deserialize_game_state(state_data) for state_data in payload["history"]],
+            actions=[action if isinstance(action, dict) else None for action in raw_actions],
         )
+        expected_actions = max(0, len(session.history) - 1)
+        if len(session.actions) < expected_actions:
+            session.actions.extend([None] * (expected_actions - len(session.actions)))
+        elif len(session.actions) > expected_actions:
+            session.actions = session.actions[:expected_actions]
         self._games[game_id] = session
         return session
 
     def create(self, seed: Optional[int] = None) -> GameSession:
         game_id = uuid.uuid4().hex[:12]
-        session = GameSession(game_id=game_id, history=[create_game(seed=seed)])
+        session = GameSession(game_id=game_id, history=[create_game(seed=seed)], actions=[])
         self._games[game_id] = session
         self._save(session)
         return session
@@ -87,19 +96,21 @@ class SessionStore:
             return self._load(game_id)
         return self._games[game_id]
 
-    def push(self, game_id: str, state: GameState) -> GameSession:
+    def push(self, game_id: str, state: GameState, action: Optional[Dict[str, Any]] = None) -> GameSession:
         session = self.get(game_id)
         session.history.append(state)
+        session.actions.append(action)
         self._save(session)
         return session
 
-    def undo(self, game_id: str) -> GameSession:
+    def undo(self, game_id: str) -> tuple[GameSession, Optional[Dict[str, Any]]]:
         session = self.get(game_id)
         if len(session.history) <= 1:
             raise InvalidMoveError("No earlier state available.")
         session.history.pop()
+        undone_action = session.actions.pop() if session.actions else None
         self._save(session)
-        return session
+        return session, undone_action
 
 
 class TrainingJob(BaseModel):
@@ -134,12 +145,12 @@ class TrainingRunRequest(BaseModel):
 class FeedbackRequest(BaseModel):
     game_id: str
     state_hash: str
-    ai_source: str
+    ai_source: str = Field(default="none")
     model_loaded: bool = False
     model_eligible: bool = False
     feedback_strength: str = Field(default="normal")
     applies_to: str = Field(default="last_move")
-    recommended_action: Dict[str, Any]
+    recommended_action: Optional[Dict[str, Any]] = None
     chosen_action: Dict[str, Any]
     candidate_actions: List[Dict[str, Any]] = Field(default_factory=list)
     state_snapshot: Dict[str, Any]
@@ -219,8 +230,51 @@ def _find_state_by_hash(session: GameSession, state_hash: str) -> Optional[tuple
     return None
 
 
-def _apply_state(game_id: str, state: GameState) -> Dict[str, Any]:
-    session = store.push(game_id, state)
+def _normalize_action_payload(action: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not action:
+        return {}
+    return {
+        "type": action.get("type"),
+        "from_column": action.get("from_column"),
+        "to_column": action.get("to_column"),
+        "run_length": action.get("run_length"),
+        "description": action.get("description"),
+    }
+
+
+def _feedback_record_key(state_hash: str, chosen_action: Optional[Dict[str, Any]]) -> str:
+    return json.dumps(
+        {
+            "state_hash": state_hash,
+            "chosen_action": _normalize_action_payload(chosen_action),
+        },
+        sort_keys=True,
+    )
+
+
+def _append_feedback_log(record: Dict[str, Any]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with feedback_lock:
+        with FEEDBACK_LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+
+
+def _invalidate_feedback_for_action(game_id: str, state_hash: str, chosen_action: Optional[Dict[str, Any]]) -> None:
+    if not chosen_action:
+        return
+    record = {
+        "record_type": "invalidation",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "game_id": game_id,
+        "state_hash": state_hash,
+        "chosen_action": _normalize_action_payload(chosen_action),
+        "feedback_key": _feedback_record_key(state_hash, chosen_action),
+    }
+    _append_feedback_log(record)
+
+
+def _apply_state(game_id: str, state: GameState, action: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    session = store.push(game_id, state, action=action)
     return _serialize_session(session)
 
 
@@ -260,7 +314,14 @@ def make_move(request: MoveRequest) -> Dict[str, Any]:
         )
     except InvalidMoveError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return _apply_state(request.game_id, next_state)
+    action = {
+        "type": "move",
+        "from_column": request.from_column,
+        "to_column": request.to_column,
+        "run_length": request.run_length,
+        "description": f"kol {request.from_column + 1} -> kol {request.to_column + 1} ({request.run_length})",
+    }
+    return _apply_state(request.game_id, next_state, action=action)
 
 
 @app.post("/game/deal")
@@ -270,24 +331,29 @@ def deal(request: GameActionRequest) -> Dict[str, Any]:
         next_state = apply_deal(session.state)
     except InvalidMoveError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return _apply_state(request.game_id, next_state)
+    action = {
+        "type": "deal",
+        "description": f"Deal from stock ({len(session.state.stock)} left)",
+    }
+    return _apply_state(request.game_id, next_state, action=action)
 
 
 @app.post("/game/concede")
 def concede(request: GameActionRequest) -> Dict[str, Any]:
     session = _get_session(request.game_id)
     next_state = apply_concede(session.state)
-    return _apply_state(request.game_id, next_state)
+    return _apply_state(request.game_id, next_state, action={"type": "concede", "description": "Concede game"})
 
 
 @app.post("/game/undo")
 def undo(request: GameActionRequest) -> Dict[str, Any]:
     try:
-        session = store.undo(request.game_id)
+        session, undone_action = store.undo(request.game_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Unknown game_id.") from exc
     except InvalidMoveError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _invalidate_feedback_for_action(request.game_id, session.state.state_hash, undone_action)
     return _serialize_session(session)
 
 
@@ -318,8 +384,8 @@ def save_feedback(request: FeedbackRequest) -> Dict[str, Any]:
         history_index, history_state = matched_state
         authoritative_snapshot = _snapshot_with_stock(history_state, request.game_id, history_index)
 
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
     record = {
+        "record_type": "feedback",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "game_id": request.game_id,
         "state_hash": request.state_hash,
@@ -333,10 +399,9 @@ def save_feedback(request: FeedbackRequest) -> Dict[str, Any]:
         "candidate_actions": request.candidate_actions,
         "state_snapshot": authoritative_snapshot,
         "note": request.note,
+        "feedback_key": _feedback_record_key(request.state_hash, request.chosen_action),
     }
-    with feedback_lock:
-        with FEEDBACK_LOG_PATH.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+    _append_feedback_log(record)
     return {"saved": True, "path": str(FEEDBACK_LOG_PATH)}
 
 
