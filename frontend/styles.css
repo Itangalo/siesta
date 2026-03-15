@@ -137,10 +137,8 @@ button.danger {
 }
 
 .board-callout {
-  display: flex;
-  gap: 1rem;
-  justify-content: space-between;
-  align-items: flex-start;
+  display: grid;
+  gap: 0.35rem;
   background:
     linear-gradient(135deg, rgba(189, 93, 56, 0.12), rgba(15, 91, 74, 0.08)),
     var(--panel);
@@ -161,6 +159,15 @@ button.danger {
 
 .selection-panel.compact {
   padding-top: 0.9rem;
+}
+
+.capture-row {
+  display: flex;
+  gap: 0.8rem;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  margin-top: 0.2rem;
 }
 
 .suggestions {
@@ -200,6 +207,18 @@ button.danger {
   margin-bottom: 0.25rem;
 }
 
+.feedback-title.inline {
+  margin-bottom: 0;
+}
+
+.last-feedback-row {
+  display: flex;
+  gap: 0.8rem;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+}
+
 .feedback-actions {
   display: flex;
   gap: 0.55rem;
@@ -207,8 +226,27 @@ button.danger {
   justify-content: flex-end;
 }
 
+.feedback-actions.compact {
+  gap: 0.35rem;
+}
+
 .feedback-actions button {
   box-shadow: none;
+  padding: 0.55rem 0.9rem;
+  background: rgba(15, 91, 74, 0.12);
+  color: var(--text);
+  border: 1px solid rgba(15, 91, 74, 0.15);
+}
+
+.feedback-actions button.active {
+  background: var(--accent);
+  color: white;
+  border-color: transparent;
+}
+
+.feedback-subtle {
+  color: var(--muted);
+  font-size: 0.92rem;
 }
 
 .suggestions.empty {

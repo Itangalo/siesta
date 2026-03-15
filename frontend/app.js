@@ -42,6 +42,7 @@ const FEEDBACK_LABELS = {
 };
 
 const ACTIVE_GAME_STORAGE_KEY = "siesta.activeGameId";
+const CAPTURE_STRENGTH_STORAGE_KEY = "siesta.captureStrength";
 const AI_REQUEST_TIMEOUT_MS = 3500;
 
 const state = {
@@ -59,6 +60,8 @@ const state = {
   aiRequestId: 0,
   aiLoading: false,
   aiAbortController: null,
+  lastFeedbackStrength: null,
+  captureStrength: "normal",
 };
 
 async function api(path, options = {}) {
@@ -133,6 +136,23 @@ function storeActiveGameId(gameId) {
     } else {
       window.localStorage.removeItem(ACTIVE_GAME_STORAGE_KEY);
     }
+  } catch (_) {
+    // Ignore storage errors; the game still works without persistence.
+  }
+}
+
+function readStoredCaptureStrength() {
+  try {
+    const value = window.localStorage.getItem(CAPTURE_STRENGTH_STORAGE_KEY);
+    return value === "important" || value === "key_move" ? value : "normal";
+  } catch (_) {
+    return "normal";
+  }
+}
+
+function storeCaptureStrength(strength) {
+  try {
+    window.localStorage.setItem(CAPTURE_STRENGTH_STORAGE_KEY, strength);
   } catch (_) {
     // Ignore storage errors; the game still works without persistence.
   }
@@ -271,19 +291,54 @@ function updateFeedbackPanel() {
   if (!state.lastFeedback) {
     lastPanel.classList.add("hidden");
     lastText.textContent = "";
+    updateLastFeedbackButtons();
     return;
   }
 
   lastPanel.classList.remove("hidden");
-  if (!state.lastFeedback.topSuggestion) {
-    lastText.textContent = `Senaste egna drag: ${state.lastFeedback.chosenAction.description}. Draget är redan sparat som träningsdata. Markera här om det bör väga extra tungt i träningen.`;
-    return;
+  lastText.textContent = `${state.lastFeedback.chosenAction.description}. Draget är redan sparat som träningsdata.`;
+  updateLastFeedbackButtons();
+}
+
+function updateLastFeedbackButtons() {
+  const strength = state.lastFeedbackStrength || "normal";
+  const mapping = {
+    normal: "last-normal",
+    important: "last-important",
+    key_move: "last-key",
+  };
+  Object.values(mapping).forEach((id) => {
+    document.getElementById(id).classList.remove("active");
+    document.getElementById(id).setAttribute("aria-pressed", "false");
+  });
+  const activeId = mapping[strength];
+  if (activeId) {
+    document.getElementById(activeId).classList.add("active");
+    document.getElementById(activeId).setAttribute("aria-pressed", "true");
   }
-  if (actionKey(state.lastFeedback.chosenAction) === actionKey(state.lastFeedback.topSuggestion)) {
-    lastText.textContent = `Senaste egna drag: ${state.lastFeedback.chosenAction.description}. Det matchade AI:ns toppförslag ${state.lastFeedback.topSuggestion.description}. Markera här om draget var särskilt viktigt eller genomtänkt.`;
-    return;
+}
+
+function updateCaptureButtons() {
+  const mapping = {
+    normal: "capture-normal",
+    important: "capture-important",
+    key_move: "capture-key",
+  };
+  Object.values(mapping).forEach((id) => {
+    document.getElementById(id).classList.remove("active");
+    document.getElementById(id).setAttribute("aria-pressed", "false");
+  });
+  const activeId = mapping[state.captureStrength || "normal"];
+  if (activeId) {
+    document.getElementById(activeId).classList.add("active");
+    document.getElementById(activeId).setAttribute("aria-pressed", "true");
   }
-  lastText.textContent = `Senaste egna drag: ${state.lastFeedback.chosenAction.description}. AI:s toppförslag var ${state.lastFeedback.topSuggestion.description}. Draget är redan sparat; markera här om det bör väga extra tungt i träningen.`;
+}
+
+function setCaptureStrength(strength) {
+  state.captureStrength = strength;
+  storeCaptureStrength(strength);
+  updateCaptureButtons();
 }
 
 function updateStatus() {
@@ -297,6 +352,7 @@ function updateStatus() {
     ? `Vald sekvens: kolumn ${selection.fromColumn + 1}, längd ${selection.runLength}. Klicka eller släpp på målkolumn.`
     : "Ingen flytt vald.";
   updateFeedbackPanel();
+  updateCaptureButtons();
 }
 
 function renderSuggestions() {
@@ -541,6 +597,8 @@ async function startNewGame() {
   state.feedbackStatus = "";
   state.savedFeedbackKeys = new Set();
   state.lastFeedback = null;
+  state.lastFeedbackStrength = null;
+  state.captureStrength = readStoredCaptureStrength();
   applySnapshot(snapshot);
 }
 
@@ -556,6 +614,8 @@ async function restoreStoredGame() {
     state.aiContext = null;
     state.feedbackStatus = "Tidigare parti ateranslutet.";
     state.lastFeedback = null;
+    state.lastFeedbackStrength = null;
+    state.captureStrength = readStoredCaptureStrength();
     applySnapshot(snapshot);
     return true;
   } catch (error) {
@@ -616,6 +676,7 @@ async function saveLastMoveFeedback(strength) {
     appliesTo: "last_move",
     note: "post-move human correction",
   });
+  state.lastFeedbackStrength = strength;
   updateFeedbackPanel();
 }
 
@@ -636,9 +697,10 @@ async function performMove(fromColumn, toColumn, runLength) {
   state.suggestions = [];
   state.aiContext = null;
   state.lastFeedback = latestFeedback;
+  state.lastFeedbackStrength = state.captureStrength;
   applySnapshot(snapshot);
   saveCorrection(latestFeedback, {
-    strength: "normal",
+    strength: state.captureStrength,
     appliesTo: "last_move",
     note: "auto-saved human move",
   }).catch((error) => {
@@ -656,9 +718,10 @@ async function performDeal() {
   state.suggestions = [];
   state.aiContext = null;
   state.lastFeedback = latestFeedback;
+  state.lastFeedbackStrength = state.captureStrength;
   applySnapshot(snapshot);
   saveCorrection(latestFeedback, {
-    strength: "normal",
+    strength: state.captureStrength,
     appliesTo: "last_move",
     note: "auto-saved human deal",
   }).catch((error) => {
@@ -675,6 +738,7 @@ async function performUndo() {
   state.suggestions = [];
   state.aiContext = null;
   state.lastFeedback = null;
+  state.lastFeedbackStrength = null;
   applySnapshot(snapshot);
 }
 
@@ -686,6 +750,7 @@ async function performConcede() {
   state.suggestions = [];
   state.aiContext = null;
   state.lastFeedback = null;
+  state.lastFeedbackStrength = null;
   applySnapshot(snapshot);
 }
 
@@ -773,8 +838,13 @@ document.getElementById("pending-key").addEventListener("click", () => saveCurre
 document.getElementById("last-normal").addEventListener("click", () => saveLastMoveFeedback("normal"));
 document.getElementById("last-important").addEventListener("click", () => saveLastMoveFeedback("important"));
 document.getElementById("last-key").addEventListener("click", () => saveLastMoveFeedback("key_move"));
+document.getElementById("capture-normal").addEventListener("click", () => setCaptureStrength("normal"));
+document.getElementById("capture-important").addEventListener("click", () => setCaptureStrength("important"));
+document.getElementById("capture-key").addEventListener("click", () => setCaptureStrength("key_move"));
 
 document.getElementById("status-text").textContent = "Laddar parti...";
+state.captureStrength = readStoredCaptureStrength();
+updateCaptureButtons();
 
 restoreStoredGame().then((restored) => {
   if (restored) {

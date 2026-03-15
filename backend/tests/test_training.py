@@ -316,6 +316,62 @@ def test_load_human_feedback_cases_skips_invalidated_entries(tmp_path):
     assert summary.unique_entries == 0
 
 
+def test_load_human_feedback_cases_prioritizes_important_and_key_move(tmp_path):
+    state_snapshot = {
+        "status": "in_progress",
+        "terminal_reason": None,
+        "moves_played": 0,
+        "stock_count": 0,
+        "completed_sequences": 0,
+        "state_hash": "weight-demo",
+        "columns": [
+            {"index": 0, "cards": [{"rank": 6, "suit": "hearts"}], "movable_run_length": 1, "height": 1},
+            {"index": 1, "cards": [{"rank": 7, "suit": "spades"}], "movable_run_length": 1, "height": 1},
+            {"index": 2, "cards": [], "movable_run_length": 0, "height": 0},
+            {"index": 3, "cards": [], "movable_run_length": 0, "height": 0},
+            {"index": 4, "cards": [], "movable_run_length": 0, "height": 0},
+            {"index": 5, "cards": [], "movable_run_length": 0, "height": 0},
+            {"index": 6, "cards": [], "movable_run_length": 0, "height": 0},
+        ],
+        "stock_cards": [],
+    }
+    rows = [
+        {
+            "record_type": "feedback",
+            "timestamp": "2026-03-14T10:00:00+00:00",
+            "state_hash": "weight-demo-normal",
+            "feedback_strength": "normal",
+            "chosen_action": {"type": "move", "from_column": 0, "to_column": 1, "run_length": 1},
+            "state_snapshot": {**state_snapshot, "state_hash": "weight-demo-normal"},
+        },
+        {
+            "record_type": "feedback",
+            "timestamp": "2026-03-14T10:00:01+00:00",
+            "state_hash": "weight-demo-important",
+            "feedback_strength": "important",
+            "chosen_action": {"type": "move", "from_column": 0, "to_column": 1, "run_length": 1},
+            "state_snapshot": {**state_snapshot, "state_hash": "weight-demo-important"},
+        },
+        {
+            "record_type": "feedback",
+            "timestamp": "2026-03-14T10:00:02+00:00",
+            "state_hash": "weight-demo-key",
+            "feedback_strength": "key_move",
+            "chosen_action": {"type": "move", "from_column": 0, "to_column": 1, "run_length": 1},
+            "state_snapshot": {**state_snapshot, "state_hash": "weight-demo-key"},
+        },
+    ]
+    path = tmp_path / "human_feedback.jsonl"
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    cases, _ = load_human_feedback_cases(path=path)
+    weights = sorted(case.weight for case in cases)
+    boosts = sorted(case.target_boost for case in cases)
+    assert len(cases) == 3
+    assert weights[0] < weights[1] < weights[2]
+    assert boosts[0] < boosts[1] < boosts[2]
+
+
 def test_human_cases_are_repeated_to_gain_training_share():
     generated_cases = build_training_cases(
         num_games=2,

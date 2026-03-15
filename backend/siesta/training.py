@@ -55,6 +55,10 @@ DEFAULT_TEACHER_BRANCH_MARGIN = 10.0
 DEFAULT_GENERATED_TARGET_BOOST = 0.65
 DEFAULT_HUMAN_TARGET_BOOST = 0.82
 DEFAULT_EXACT_HUMAN_TARGET_BOOST = 0.9
+DEFAULT_IMPORTANT_HUMAN_TARGET_BOOST = 0.9
+DEFAULT_IMPORTANT_EXACT_HUMAN_TARGET_BOOST = 0.96
+DEFAULT_KEY_HUMAN_TARGET_BOOST = 0.96
+DEFAULT_KEY_EXACT_HUMAN_TARGET_BOOST = 0.995
 DEFAULT_HUMAN_TARGET_SHARE = 0.18
 DEFAULT_MAX_HUMAN_REPEAT_FACTOR = 32
 ProgressCallback = Optional[Callable[[str], None]]
@@ -1381,11 +1385,19 @@ def reconstruct_feedback_state(snapshot: Dict[str, Any]) -> Tuple[GameState, boo
 
 def _feedback_strength_weight(strength: str) -> float:
     weights = {
-        "normal": 8.0,
-        "important": 14.0,
-        "key_move": 22.0,
+        "normal": 5.0,
+        "important": 18.0,
+        "key_move": 36.0,
     }
     return weights.get(strength, 4.0)
+
+
+def _feedback_target_boost(strength: str, exact_stock: bool) -> float:
+    if strength == "key_move":
+        return DEFAULT_KEY_EXACT_HUMAN_TARGET_BOOST if exact_stock else DEFAULT_KEY_HUMAN_TARGET_BOOST
+    if strength == "important":
+        return DEFAULT_IMPORTANT_EXACT_HUMAN_TARGET_BOOST if exact_stock else DEFAULT_IMPORTANT_HUMAN_TARGET_BOOST
+    return DEFAULT_EXACT_HUMAN_TARGET_BOOST if exact_stock else DEFAULT_HUMAN_TARGET_BOOST
 
 
 def human_case_repeat_factor(
@@ -1559,7 +1571,8 @@ def load_human_feedback_cases(
         ranked_map = dict(heuristic_scores)
         ranked_map[chosen_signature] = max(ranked_map[chosen_signature], best_non_chosen + 30.0)
         soft_targets = teacher_soft_targets(signatures, ranked_map)
-        weight = _feedback_strength_weight(str(record.get("feedback_strength", "normal")))
+        strength = str(record.get("feedback_strength", "normal"))
+        weight = _feedback_strength_weight(strength)
         if move_creates_hole(state, actions[matched_index]):
             weight += 1.0
         if not exact_stock:
@@ -1574,7 +1587,7 @@ def load_human_feedback_cases(
                 chosen_signature=chosen_signature,
                 action_signatures=signatures,
                 soft_targets=soft_targets,
-                target_boost=DEFAULT_EXACT_HUMAN_TARGET_BOOST if exact_stock else DEFAULT_HUMAN_TARGET_BOOST,
+                target_boost=_feedback_target_boost(strength, exact_stock),
                 source="human",
             )
         )

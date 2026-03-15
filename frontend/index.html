@@ -49,15 +49,15 @@
       </section>
 
       <section id="board-callout" class="board-callout hidden">
-        <div>
-          <div class="feedback-title">Gäller draget du just gjorde</div>
-          <div id="last-feedback-text"></div>
+        <div class="last-feedback-row">
+          <span class="feedback-title inline">Senaste draget var</span>
+          <div class="feedback-actions compact">
+            <button id="last-normal" type="button">Vanligt</button>
+            <button id="last-important" type="button">Viktigt</button>
+            <button id="last-key" type="button">Mycket viktigt</button>
+          </div>
         </div>
-        <div class="feedback-actions">
-          <button id="last-normal" type="button">Vanligt</button>
-          <button id="last-important" type="button">Viktig</button>
-          <button id="last-key" type="button">Nyckeldrag</button>
-        </div>
+        <div id="last-feedback-text" class="feedback-subtle"></div>
       </section>
 
       <main>
@@ -84,6 +84,14 @@
             <div>
               <span class="label">AI-stöd</span>
               <strong id="selection-text">Ingen flytt vald.</strong>
+            </div>
+          </div>
+          <div class="capture-row">
+            <span class="feedback-title inline">Kommande drag loggas som</span>
+            <div class="feedback-actions compact">
+              <button id="capture-normal" type="button">Vanligt</button>
+              <button id="capture-important" type="button">Viktigt</button>
+              <button id="capture-key" type="button">Mycket viktigt</button>
             </div>
           </div>
           <div id="ai-summary" class="ai-summary">Ladda AI-förslag för att se hur agenten resonerar.</div>
