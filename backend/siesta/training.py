@@ -13,7 +13,9 @@ from .game import (
     Card,
     GameState,
     Move,
+    STATUS_CONCEDED,
     STATUS_IN_PROGRESS,
+    STATUS_WON,
     apply_deal,
     apply_move,
     can_deal,
@@ -29,12 +31,17 @@ from .game import (
 MODELS_DIR = Path(__file__).resolve().parents[1] / "models"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
+DEFAULT_SESSIONS_DIR = DATA_DIR / "sessions"
 DEFAULT_MODEL_PATH = MODELS_DIR / "policy-latest.npz"
 DEFAULT_METADATA_PATH = MODELS_DIR / "policy-latest.json"
 DEFAULT_CANDIDATE_MODEL_PATH = MODELS_DIR / "policy-candidate.npz"
 DEFAULT_CANDIDATE_METADATA_PATH = MODELS_DIR / "policy-candidate.json"
 DEFAULT_BEST_MODEL_PATH = MODELS_DIR / "policy-best.npz"
 DEFAULT_BEST_METADATA_PATH = MODELS_DIR / "policy-best.json"
+DEFAULT_HOLE_MODEL_PATH = MODELS_DIR / "hole-policy-latest.npz"
+DEFAULT_HOLE_METADATA_PATH = MODELS_DIR / "hole-policy-latest.json"
+DEFAULT_HOLE_CANDIDATE_MODEL_PATH = MODELS_DIR / "hole-policy-candidate.npz"
+DEFAULT_HOLE_CANDIDATE_METADATA_PATH = MODELS_DIR / "hole-policy-candidate.json"
 DEFAULT_FEEDBACK_PATH = DATA_DIR / "human_feedback.jsonl"
 DEFAULT_SEARCH_DEPTH = 2
 DEFAULT_SEARCH_BEAM_WIDTH = 4
@@ -61,6 +68,8 @@ DEFAULT_KEY_HUMAN_TARGET_BOOST = 0.96
 DEFAULT_KEY_EXACT_HUMAN_TARGET_BOOST = 0.995
 DEFAULT_HUMAN_TARGET_SHARE = 0.18
 DEFAULT_MAX_HUMAN_REPEAT_FACTOR = 32
+DEFAULT_HOLE_GOAL_HORIZON = 5
+DEFAULT_HOLE_GOAL_BEAM_WIDTH = 6
 ProgressCallback = Optional[Callable[[str], None]]
 
 
@@ -103,6 +112,10 @@ class HumanFeedbackSummary:
     skipped_missing_action: int = 0
     inferred_stock_cases: int = 0
     invalidated_entries: int = 0
+    won_cases: int = 0
+    conceded_cases: int = 0
+    unknown_outcome_cases: int = 0
+    skipped_normal_conceded_cases: int = 0
 
 
 def emit_progress(progress: ProgressCallback, message: str) -> None:
@@ -137,8 +150,20 @@ def run_depth(state: GameState) -> int:
     return max((top_run_length(column) for column in state.columns), default=0)
 
 
-def progress_score(state: GameState) -> int:
-    return state.completed_sequences * 13 + run_depth(state)
+def progress_score(state: GameState) -> float:
+    empty_columns = empty_column_count(state)
+    hole_bonus = 5.0 * empty_columns
+    if empty_columns >= 2:
+        hole_bonus += 4.0 * (empty_columns - 1)
+
+    return (
+        state.completed_sequences * 100.0
+        + hole_bonus
+        + 0.9 * hole_access_score(state)
+        + 0.45 * hole_setup_score(state)
+        + 0.35 * run_depth(state)
+        + 0.08 * total_run_depth(state)
+    )
 
 
 def total_run_depth(state: GameState) -> int:
@@ -351,6 +376,88 @@ def evaluate_state_snapshot(state: GameState) -> float:
     return score
 
 
+def hole_goal_state_score(state: GameState) -> float:
+    empty_columns = empty_column_count(state)
+    score = 0.0
+    if empty_columns >= 1:
+        score += 90.0
+    if empty_columns >= 2:
+        score += 70.0 + 25.0 * (empty_columns - 2)
+    score += 10.0 * hole_access_score(state)
+    score += 4.0 * hole_setup_score(state)
+    score += 0.6 * mobility_score(state)
+    score -= 1.5 * blocked_mid_rank_risk(state)
+    score -= 0.2 * top_color_mix_penalty(state)
+    score += 0.6 * run_depth(state)
+    score += 0.15 * total_run_depth(state)
+    score += 150.0 * state.completed_sequences
+    return score
+
+
+def _beam_states_for_hole_goal(states: Sequence[Tuple[GameState, int]], beam_width: int) -> List[Tuple[GameState, int]]:
+    ranked = sorted(states, key=lambda item: hole_goal_state_score(item[0]), reverse=True)
+    selected: List[Tuple[GameState, int]] = []
+    seen_hashes = set()
+    for state, depth in ranked:
+        if state.state_hash in seen_hashes:
+            continue
+        selected.append((state, depth))
+        seen_hashes.add(state.state_hash)
+        if len(selected) >= beam_width:
+            break
+    return selected
+
+
+def best_hole_goal_outcome(
+    state: GameState,
+    horizon: int = DEFAULT_HOLE_GOAL_HORIZON,
+    beam_width: int = DEFAULT_HOLE_GOAL_BEAM_WIDTH,
+) -> Dict[str, Any]:
+    best_score = hole_goal_state_score(state)
+    best_empty = empty_column_count(state)
+    first_hole_depth = 0 if best_empty > 0 else None
+    frontier: List[Tuple[GameState, int]] = [(state, 0)]
+    seen_depths = {state.state_hash: 0}
+
+    for _ in range(horizon):
+        expanded: List[Tuple[GameState, int]] = []
+        for current_state, depth in frontier:
+            current_empty = empty_column_count(current_state)
+            current_score = hole_goal_state_score(current_state)
+            if current_score > best_score:
+                best_score = current_score
+                best_empty = current_empty
+            if current_empty > 0 and first_hole_depth is None:
+                first_hole_depth = depth
+            if depth >= horizon or current_state.status != STATUS_IN_PROGRESS:
+                continue
+            for action in available_actions(current_state):
+                next_state = apply_action(current_state, action)
+                next_depth = depth + 1
+                next_empty = empty_column_count(next_state)
+                next_score = hole_goal_state_score(next_state)
+                if next_score > best_score:
+                    best_score = next_score
+                    best_empty = next_empty
+                if next_empty > 0 and first_hole_depth is None:
+                    first_hole_depth = next_depth
+                previous_depth = seen_depths.get(next_state.state_hash)
+                if previous_depth is not None and previous_depth <= next_depth:
+                    continue
+                seen_depths[next_state.state_hash] = next_depth
+                expanded.append((next_state, next_depth))
+        if not expanded:
+            break
+        frontier = _beam_states_for_hole_goal(expanded, beam_width=beam_width)
+
+    return {
+        "reachable": first_hole_depth is not None,
+        "first_hole_depth": first_hole_depth,
+        "best_empty_columns": best_empty,
+        "best_score": best_score,
+    }
+
+
 def choose_heuristic_action(state: GameState, rng: Optional[random.Random] = None) -> Optional[Action]:
     actions = available_actions(state)
     if not actions:
@@ -369,6 +476,37 @@ def choose_random_action(state: GameState, rng: Optional[random.Random] = None) 
     return rng.choice(actions)
 
 
+def rank_hole_search_actions(
+    state: GameState,
+    horizon: int = DEFAULT_HOLE_GOAL_HORIZON,
+    beam_width: int = DEFAULT_HOLE_GOAL_BEAM_WIDTH,
+) -> List[Tuple[float, Action]]:
+    actions = available_actions(state)
+    ranked: List[Tuple[float, Action]] = []
+    for action in actions:
+        next_state = apply_action(state, action)
+        outcome = best_hole_goal_outcome(next_state, horizon=max(0, horizon - 1), beam_width=beam_width)
+        score = outcome["best_score"]
+        if outcome["reachable"]:
+            score += 220.0
+            depth = outcome["first_hole_depth"] if outcome["first_hole_depth"] is not None else horizon
+            score += max(0.0, 25.0 - 4.0 * depth)
+        score += 30.0 * min(2, outcome["best_empty_columns"])
+        score += 0.4 * evaluate_action(state, action)
+        ranked.append((score, action))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return ranked
+
+
+def choose_hole_search_action(
+    state: GameState,
+    horizon: int = DEFAULT_HOLE_GOAL_HORIZON,
+    beam_width: int = DEFAULT_HOLE_GOAL_BEAM_WIDTH,
+) -> Optional[Action]:
+    ranked = rank_hole_search_actions(state, horizon=horizon, beam_width=beam_width)
+    return ranked[0][1] if ranked else None
+
+
 def action_signature(state: GameState, action: Action) -> str:
     return action.to_dict(state)["description"]
 
@@ -385,6 +523,21 @@ def action_payload_matches(action: Action, payload: Dict[str, Any]) -> bool:
         and action.move.to_column == payload.get("to_column")
         and action.move.run_length == payload.get("run_length")
     )
+
+
+def _hole_teacher_targets(
+    state: GameState,
+    actions: Sequence[Action],
+    horizon: int = DEFAULT_HOLE_GOAL_HORIZON,
+    beam_width: int = DEFAULT_HOLE_GOAL_BEAM_WIDTH,
+) -> Tuple[List[Tuple[float, Action]], Dict[str, float]]:
+    ranked_actions = rank_hole_search_actions(state, horizon=horizon, beam_width=beam_width)
+    score_map = {action_signature(state, action): score for score, action in ranked_actions}
+    for action in actions:
+        signature = action_signature(state, action)
+        if signature not in score_map:
+            score_map[signature] = 0.4 * evaluate_action(state, action)
+    return ranked_actions, score_map
 
 
 def _rollout_tail_value(
@@ -890,6 +1043,16 @@ def build_training_cases(
                     )
                     teacher_scores = [score for score, _ in scored]
                     teacher_order = [action_signature(state, action) for _, action in scored]
+                elif teacher_policy == "hole_search":
+                    ranked_actions, score_map = _hole_teacher_targets(
+                        state,
+                        actions,
+                        horizon=DEFAULT_HOLE_GOAL_HORIZON,
+                        beam_width=DEFAULT_HOLE_GOAL_BEAM_WIDTH,
+                    )
+                    chosen = ranked_actions[0][1] if ranked_actions else None
+                    teacher_order = [action_signature(state, action) for _, action in ranked_actions]
+                    teacher_scores = [score_map[signature] for signature in teacher_order]
                 else:
                     raise ValueError(f"Unsupported teacher policy: {teacher_policy}")
                 if chosen is None:
@@ -943,6 +1106,57 @@ def build_training_cases(
             )
     if not cases:
         raise RuntimeError("No training examples were generated.")
+    return cases
+
+
+def build_hole_opening_cases(
+    num_games: int = 60,
+    seed_offset: int = 0,
+    horizon: int = DEFAULT_HOLE_GOAL_HORIZON,
+    beam_width: int = DEFAULT_HOLE_GOAL_BEAM_WIDTH,
+    progress: ProgressCallback = None,
+) -> List[TrainingCase]:
+    cases: List[TrainingCase] = []
+    game_seeds = training_game_seeds(num_games=num_games, seed_offset=seed_offset)
+    progress_every = max(1, num_games // 10)
+    emit_progress(progress, f"[hole-data] generating opening cases from {num_games} games")
+
+    for game_index, game_seed in enumerate(game_seeds, start=1):
+        state = create_game(seed=game_seed)
+        actions = available_actions(state)
+        if not actions:
+            continue
+        ranked_actions, score_map = _hole_teacher_targets(state, actions, horizon=horizon, beam_width=beam_width)
+        if not ranked_actions:
+            continue
+        chosen = ranked_actions[0][1]
+        signatures = [action_signature(state, action) for action in actions]
+        chosen_signature = action_signature(state, chosen)
+        target_index = signatures.index(chosen_signature)
+        soft_targets = teacher_soft_targets(signatures, score_map)
+        best_outcome = best_hole_goal_outcome(apply_action(state, chosen), horizon=max(0, horizon - 1), beam_width=beam_width)
+        weight = 1.0
+        if best_outcome["reachable"]:
+            weight += 1.5
+        if best_outcome["best_empty_columns"] >= 2:
+            weight += 0.5
+        cases.append(
+            TrainingCase(
+                features=np.vstack([encode_action(state, action) for action in actions]),
+                target_index=target_index,
+                weight=weight,
+                chosen_signature=chosen_signature,
+                action_signatures=signatures,
+                soft_targets=soft_targets,
+                target_boost=0.82,
+                source="hole_opening",
+            )
+        )
+        if game_index % progress_every == 0 or game_index == num_games:
+            emit_progress(progress, f"[hole-data] processed {game_index}/{num_games} games, cases={len(cases)}")
+
+    if not cases:
+        raise RuntimeError("No hole-opening examples were generated.")
     return cases
 
 
@@ -1012,6 +1226,10 @@ def train_policy_model(
         "human_feedback_records_seen": human_feedback_summary.records_seen,
         "human_feedback_unique_entries": human_feedback_summary.unique_entries,
         "human_feedback_inferred_stock_cases": human_feedback_summary.inferred_stock_cases,
+        "human_feedback_won_cases": human_feedback_summary.won_cases,
+        "human_feedback_conceded_cases": human_feedback_summary.conceded_cases,
+        "human_feedback_unknown_outcome_cases": human_feedback_summary.unknown_outcome_cases,
+        "human_feedback_skipped_normal_conceded_cases": human_feedback_summary.skipped_normal_conceded_cases,
         "teacher_search_depth": DEFAULT_TEACHER_SEARCH_DEPTH,
         "teacher_search_beam_width": DEFAULT_TEACHER_SEARCH_BEAM_WIDTH,
         "teacher_search_rollout_steps": DEFAULT_TEACHER_SEARCH_ROLLOUT_STEPS,
@@ -1042,6 +1260,120 @@ def train_policy_model(
     }
 
 
+def _hole_model_is_better(candidate_eval: Dict[str, Any], reference_eval: Optional[Dict[str, Any]]) -> bool:
+    if not reference_eval:
+        return True
+    candidate_key = (
+        float(candidate_eval.get("success_rate", 0.0)),
+        float(candidate_eval.get("average_best_empty_columns", 0.0)),
+        -float(candidate_eval.get("average_first_hole_depth", 999.0)),
+        float(candidate_eval.get("average_best_score", 0.0)),
+    )
+    reference_key = (
+        float(reference_eval.get("success_rate", 0.0)),
+        float(reference_eval.get("average_best_empty_columns", 0.0)),
+        -float(reference_eval.get("average_first_hole_depth", 999.0)),
+        float(reference_eval.get("average_best_score", 0.0)),
+    )
+    return candidate_key > reference_key
+
+
+def save_hole_candidate_checkpoint(model: "NumpyPolicyNetwork", metadata: Dict[str, Any]) -> None:
+    model.save(DEFAULT_HOLE_CANDIDATE_MODEL_PATH)
+    DEFAULT_HOLE_CANDIDATE_METADATA_PATH.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+
+def promote_hole_candidate_checkpoint(candidate_metadata: Dict[str, Any]) -> None:
+    shutil.copyfile(DEFAULT_HOLE_CANDIDATE_MODEL_PATH, DEFAULT_HOLE_MODEL_PATH)
+    DEFAULT_HOLE_METADATA_PATH.write_text(json.dumps(candidate_metadata, indent=2), encoding="utf-8")
+
+
+def train_hole_opening_model(
+    num_games: int = 120,
+    epochs: int = 30,
+    learning_rate: float = 0.02,
+    hidden_dim: int = 64,
+    benchmark_games: int = 50,
+    horizon: int = DEFAULT_HOLE_GOAL_HORIZON,
+    beam_width: int = DEFAULT_HOLE_GOAL_BEAM_WIDTH,
+    progress: ProgressCallback = None,
+) -> Dict[str, Any]:
+    cases = build_hole_opening_cases(
+        num_games=num_games,
+        horizon=horizon,
+        beam_width=beam_width,
+        progress=progress,
+    )
+    benchmark_seeds = list(range(benchmark_games))
+    active_model_before = load_hole_model()
+    model = NumpyPolicyNetwork(input_dim=cases[0].features.shape[1], hidden_dim=hidden_dim)
+    emit_progress(progress, f"[hole-train] training on {len(cases)} opening states")
+    metrics = model.train_ranked(cases, epochs=epochs, learning_rate=learning_rate, progress=progress)
+
+    heuristic_eval = benchmark_hole_goal(
+        policies=("heuristic",),
+        games=benchmark_games,
+        horizon=horizon,
+        beam_width=beam_width,
+        progress=progress,
+    )["heuristic"]
+    search_eval = benchmark_hole_goal(
+        policies=("search", "hole_search"),
+        games=benchmark_games,
+        horizon=horizon,
+        beam_width=beam_width,
+        progress=progress,
+    )
+    candidate_eval = evaluate_hole_goal(
+        policy="model",
+        seeds=benchmark_seeds,
+        model=model,
+        horizon=horizon,
+        beam_width=beam_width,
+        progress=progress,
+    )
+    active_eval_before = None
+    if active_model_before is not None:
+        active_eval_before = evaluate_hole_goal(
+            policy="model",
+            seeds=benchmark_seeds,
+            model=active_model_before,
+            horizon=horizon,
+            beam_width=beam_width,
+            progress=progress,
+        )
+
+    promoted_to_active = _hole_model_is_better(candidate_eval, active_eval_before)
+    active_eval = candidate_eval if promoted_to_active or active_eval_before is None else active_eval_before
+    metadata = {
+        "num_games": num_games,
+        "epochs": epochs,
+        "learning_rate": learning_rate,
+        "hidden_dim": hidden_dim,
+        "benchmark_games": benchmark_games,
+        "horizon": horizon,
+        "beam_width": beam_width,
+        "training_cases": len(cases),
+        "metrics": metrics,
+        "heuristic_hole_evaluation": heuristic_eval,
+        "search_hole_evaluation": search_eval["search"],
+        "hole_search_evaluation": search_eval["hole_search"],
+        "candidate_model_evaluation": candidate_eval,
+        "active_model_before_evaluation": active_eval_before,
+        "active_model_evaluation": active_eval,
+        "model_evaluation": active_eval,
+        "promoted_to_active": promoted_to_active,
+    }
+    save_hole_candidate_checkpoint(model, metadata)
+    if promoted_to_active:
+        promote_hole_candidate_checkpoint(metadata)
+    return {
+        "model_path": str(DEFAULT_HOLE_MODEL_PATH),
+        "candidate_model_path": str(DEFAULT_HOLE_CANDIDATE_MODEL_PATH),
+        **metadata,
+    }
+
+
 def load_latest_model() -> Optional[NumpyPolicyNetwork]:
     if not DEFAULT_MODEL_PATH.exists():
         return None
@@ -1057,6 +1389,21 @@ def load_model_metadata() -> Dict[str, Any]:
     return json.loads(DEFAULT_METADATA_PATH.read_text(encoding="utf-8"))
 
 
+def load_hole_model() -> Optional[NumpyPolicyNetwork]:
+    if not DEFAULT_HOLE_MODEL_PATH.exists():
+        return None
+    model = NumpyPolicyNetwork.load(DEFAULT_HOLE_MODEL_PATH)
+    if model.input_dim != current_input_dim():
+        return None
+    return model
+
+
+def load_hole_model_metadata() -> Dict[str, Any]:
+    if not DEFAULT_HOLE_METADATA_PATH.exists():
+        return {}
+    return json.loads(DEFAULT_HOLE_METADATA_PATH.read_text(encoding="utf-8"))
+
+
 def choose_model_action(state: GameState, model: NumpyPolicyNetwork) -> Optional[Action]:
     actions = available_actions(state)
     if not actions:
@@ -1065,6 +1412,163 @@ def choose_model_action(state: GameState, model: NumpyPolicyNetwork) -> Optional
     scores = model.score(features)
     best_index = int(np.argmax(scores))
     return actions[best_index]
+
+
+def play_hole_goal_episode(
+    policy: str,
+    seed: int,
+    model: Optional[NumpyPolicyNetwork] = None,
+    horizon: int = DEFAULT_HOLE_GOAL_HORIZON,
+    beam_width: int = DEFAULT_HOLE_GOAL_BEAM_WIDTH,
+    progress: ProgressCallback = None,
+) -> Dict[str, Any]:
+    state = create_game(seed=seed)
+    best_empty = empty_column_count(state)
+    best_score = hole_goal_state_score(state)
+    first_hole_depth = 0 if best_empty > 0 else None
+    rng = random.Random(seed + 4000)
+
+    for depth in range(horizon):
+        if empty_column_count(state) > 0 and first_hole_depth is None:
+            first_hole_depth = depth
+        if state.status != STATUS_IN_PROGRESS:
+            break
+        action = choose_policy_action(
+            state,
+            policy=policy,
+            rng=rng,
+            model=model,
+        )
+        if action is None:
+            break
+        if policy == "hole_search":
+            action = choose_hole_search_action(state, horizon=max(1, horizon - depth), beam_width=beam_width)
+            if action is None:
+                break
+        state = apply_action(state, action)
+        best_empty = max(best_empty, empty_column_count(state))
+        best_score = max(best_score, hole_goal_state_score(state))
+        if empty_column_count(state) > 0 and first_hole_depth is None:
+            first_hole_depth = depth + 1
+
+    label = f"hole-game seed={seed}"
+    emit_progress(
+        progress,
+        f"[hole-eval:{policy}] {label} success={first_hole_depth is not None} best_empty={best_empty}",
+    )
+    return {
+        "seed": seed,
+        "success": first_hole_depth is not None,
+        "first_hole_depth": first_hole_depth,
+        "best_empty_columns": best_empty,
+        "best_score": best_score,
+    }
+
+
+def evaluate_hole_goal(
+    policy: str = "heuristic",
+    seeds: Optional[Sequence[int]] = None,
+    model: Optional[NumpyPolicyNetwork] = None,
+    horizon: int = DEFAULT_HOLE_GOAL_HORIZON,
+    beam_width: int = DEFAULT_HOLE_GOAL_BEAM_WIDTH,
+    progress: ProgressCallback = None,
+) -> Dict[str, Any]:
+    if policy == "model" and model is None:
+        model = load_hole_model()
+    if policy == "model" and model is None:
+        emit_progress(progress, "[hole-eval:model] no compatible model checkpoint found")
+        return {
+            "policy": policy,
+            "games": 0,
+            "success_rate": 0.0,
+            "average_best_empty_columns": 0.0,
+            "average_first_hole_depth": float(horizon + 1),
+            "average_best_score": 0.0,
+            "episodes": [],
+            "available": False,
+        }
+    seeds = list(seeds or range(20))
+    episodes = []
+    report_every = max(1, len(seeds) // 5)
+    emit_progress(progress, f"[hole-eval:{policy}] running {len(seeds)} games horizon={horizon}")
+    for index, seed in enumerate(seeds, start=1):
+        episodes.append(
+            play_hole_goal_episode(
+                policy=policy,
+                seed=seed,
+                model=model,
+                horizon=horizon,
+                beam_width=beam_width,
+                progress=progress,
+            )
+        )
+        if index % report_every == 0 or index == len(seeds):
+            success_rate = sum(1 for episode in episodes if episode["success"]) / len(episodes)
+            emit_progress(progress, f"[hole-eval:{policy}] completed {index}/{len(seeds)} games success_rate={success_rate:.2f}")
+
+    successful_depths = [episode["first_hole_depth"] for episode in episodes if episode["first_hole_depth"] is not None]
+    average_depth = float(sum(successful_depths) / len(successful_depths)) if successful_depths else float(horizon + 1)
+    return {
+        "policy": policy,
+        "games": len(episodes),
+        "success_rate": sum(1 for episode in episodes if episode["success"]) / len(episodes),
+        "average_best_empty_columns": float(sum(episode["best_empty_columns"] for episode in episodes) / len(episodes)),
+        "average_first_hole_depth": average_depth,
+        "average_best_score": float(sum(episode["best_score"] for episode in episodes) / len(episodes)),
+        "episodes": episodes,
+    }
+
+
+def benchmark_hole_goal(
+    policies: Sequence[str] = ("heuristic", "search", "hole_search", "model"),
+    games: int = 20,
+    horizon: int = DEFAULT_HOLE_GOAL_HORIZON,
+    beam_width: int = DEFAULT_HOLE_GOAL_BEAM_WIDTH,
+    model: Optional[NumpyPolicyNetwork] = None,
+    progress: ProgressCallback = None,
+) -> Dict[str, Dict[str, Any]]:
+    benchmark: Dict[str, Dict[str, Any]] = {}
+    seeds = list(range(games))
+    for policy in policies:
+        loaded_model = model
+        if policy == "model" and loaded_model is None:
+            loaded_model = load_hole_model()
+        benchmark[policy] = {
+            key: value
+            for key, value in evaluate_hole_goal(
+                policy=policy,
+                seeds=seeds,
+                model=loaded_model,
+                horizon=horizon,
+                beam_width=beam_width,
+                progress=progress,
+            ).items()
+            if key != "episodes"
+        }
+    return benchmark
+
+
+def _rank_weight_map(
+    ranked_pairs: Sequence[Tuple[float, Action]],
+    state: GameState,
+) -> Dict[str, float]:
+    total = len(ranked_pairs)
+    if total <= 1:
+        return {action_signature(state, action): 1.0 for _, action in ranked_pairs}
+    return {
+        action_signature(state, action): (total - index - 1) / (total - 1)
+        for index, (_, action) in enumerate(ranked_pairs)
+    }
+
+
+def should_use_hole_opening_signal(state: GameState) -> bool:
+    return (
+        state.status == STATUS_IN_PROGRESS
+        and state.moves_played <= 2
+        and state.completed_sequences == 0
+        and empty_column_count(state) == 0
+        and len(state.stock) >= 17
+    )
 
 
 def choose_policy_action(
@@ -1089,6 +1593,8 @@ def choose_policy_action(
             discount=search_discount,
             rollout_steps=search_rollout_steps,
         )
+    if policy == "hole_search":
+        return choose_hole_search_action(state)
     if policy == "model" and model is not None:
         return choose_model_action(state, model)
     return choose_heuristic_action(state, rng=rng)
@@ -1338,20 +1844,48 @@ def rank_actions_for_state(state: GameState, limit: int = 5) -> Dict[str, Any]:
     metadata = load_model_metadata()
     model_eligible = bool(model is not None and metadata.get("eligible_for_ui"))
     model_scores: Dict[str, float] = {}
+    hole_model = load_hole_model()
+    hole_metadata = load_hole_model_metadata()
+    hole_model_eligible = bool(hole_model is not None and hole_metadata)
+    hole_model_scores: Dict[str, float] = {}
     if model is not None and actions:
         features = np.vstack([encode_action(state, action) for action in actions])
         predictions = model.score(features)
         for action, score in zip(actions, predictions):
             model_scores[action.to_dict(state)["description"]] = float(score)
 
+    opening_hole_signal_active = bool(hole_model_eligible and should_use_hole_opening_signal(state))
+    if opening_hole_signal_active and hole_model is not None and actions:
+        features = np.vstack([encode_action(state, action) for action in actions])
+        predictions = hole_model.score(features)
+        for action, score in zip(actions, predictions):
+            hole_model_scores[action.to_dict(state)["description"]] = float(score)
+
+    base_ranked = list(heuristic_ranked)
     if model_eligible:
-        heuristic_ranked.sort(
+        base_ranked.sort(
             key=lambda item: model_scores.get(item[1].to_dict(state)["description"], -1.0),
             reverse=True,
         )
 
+    if opening_hole_signal_active and hole_model_scores:
+        base_rank_weights = _rank_weight_map(base_ranked, state)
+        hole_ranked = sorted(
+            ((hole_model_scores.get(action_signature(state, action), -1.0), action) for _, action in base_ranked),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        hole_rank_weights = _rank_weight_map(hole_ranked, state)
+        base_ranked.sort(
+            key=lambda item: (
+                base_rank_weights.get(action_signature(state, item[1]), 0.0)
+                + 0.65 * hole_rank_weights.get(action_signature(state, item[1]), 0.0)
+            ),
+            reverse=True,
+        )
+
     ranked: List[Dict[str, Any]] = []
-    for heuristic_score, action in heuristic_ranked[:limit]:
+    for heuristic_score, action in base_ranked[:limit]:
         action_dict = action.to_dict(state)
         ranked.append(
             {
@@ -1359,9 +1893,20 @@ def rank_actions_for_state(state: GameState, limit: int = 5) -> Dict[str, Any]:
                 "heuristic_score": heuristic_scores[action_dict["description"]],
                 "search_score": search_scores.get(action_dict["description"]),
                 "model_score": model_scores.get(action_dict["description"]),
+                "hole_model_score": hole_model_scores.get(action_dict["description"]),
             }
         )
-    return {"suggestions": ranked, "model_loaded": model is not None, "model_eligible": model_eligible}
+    ranking_source = "model" if model_eligible else "search"
+    if opening_hole_signal_active and hole_model_scores:
+        ranking_source = f"{ranking_source}+hole"
+    return {
+        "suggestions": ranked,
+        "model_loaded": model is not None,
+        "model_eligible": model_eligible,
+        "hole_model_loaded": hole_model is not None,
+        "hole_model_active": opening_hole_signal_active and bool(hole_model_scores),
+        "ranking_source": ranking_source,
+    }
 
 
 def teacher_soft_targets(
@@ -1417,6 +1962,33 @@ def _feedback_target_boost(strength: str, exact_stock: bool) -> float:
     if strength == "important":
         return DEFAULT_IMPORTANT_EXACT_HUMAN_TARGET_BOOST if exact_stock else DEFAULT_IMPORTANT_HUMAN_TARGET_BOOST
     return DEFAULT_EXACT_HUMAN_TARGET_BOOST if exact_stock else DEFAULT_HUMAN_TARGET_BOOST
+
+
+def _load_game_outcomes(sessions_dir: Path = DEFAULT_SESSIONS_DIR) -> Dict[str, str]:
+    outcomes: Dict[str, str] = {}
+    if not sessions_dir.exists():
+        return outcomes
+    for path in sessions_dir.glob("*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        history = payload.get("history") or []
+        if not history:
+            continue
+        last_state = history[-1]
+        status = str(last_state.get("status", STATUS_IN_PROGRESS))
+        game_id = str(payload.get("game_id", path.stem))
+        outcomes[game_id] = status
+    return outcomes
+
+
+def _outcome_weight_multiplier(outcome: str) -> float:
+    if outcome == STATUS_WON:
+        return 1.6
+    if outcome == STATUS_CONCEDED:
+        return 0.82
+    return 1.0
 
 
 def human_case_repeat_factor(
@@ -1550,6 +2122,7 @@ def _dedupe_feedback_records(records: Sequence[Dict[str, Any]]) -> List[Dict[str
 
 def load_human_feedback_cases(
     path: Path = DEFAULT_FEEDBACK_PATH,
+    sessions_dir: Path = DEFAULT_SESSIONS_DIR,
     progress: ProgressCallback = None,
 ) -> Tuple[List[TrainingCase], HumanFeedbackSummary]:
     summary = HumanFeedbackSummary()
@@ -1557,6 +2130,7 @@ def load_human_feedback_cases(
         emit_progress(progress, f"[feedback] no human feedback file at {path}")
         return [], summary
 
+    game_outcomes = _load_game_outcomes(sessions_dir=sessions_dir)
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     summary.records_seen = len(rows)
     filtered_rows, invalidated_count = _filter_invalidated_feedback_records(rows)
@@ -1591,7 +2165,19 @@ def load_human_feedback_cases(
         ranked_map[chosen_signature] = max(ranked_map[chosen_signature], best_non_chosen + 30.0)
         soft_targets = teacher_soft_targets(signatures, ranked_map)
         strength = str(record.get("feedback_strength", "normal"))
+        game_outcome = game_outcomes.get(str(record.get("game_id", "")), STATUS_IN_PROGRESS)
+        if strength == "normal" and game_outcome == STATUS_CONCEDED:
+            summary.skipped_normal_conceded_cases += 1
+            continue
+
         weight = _feedback_strength_weight(strength)
+        weight *= _outcome_weight_multiplier(game_outcome)
+        if game_outcome == STATUS_WON:
+            summary.won_cases += 1
+        elif game_outcome == STATUS_CONCEDED:
+            summary.conceded_cases += 1
+        else:
+            summary.unknown_outcome_cases += 1
         if move_creates_hole(state, actions[matched_index]):
             weight += 1.0
         if not exact_stock:
@@ -1617,6 +2203,8 @@ def load_human_feedback_cases(
         "[feedback] loaded "
         f"{summary.cases_loaded}/{summary.unique_entries} human cases "
         f"(records={summary.records_seen}, invalidated={summary.invalidated_entries}, "
+        f"won={summary.won_cases}, conceded={summary.conceded_cases}, unknown={summary.unknown_outcome_cases}, "
+        f"skipped_normal_conceded={summary.skipped_normal_conceded_cases}, "
         f"inferred_stock={summary.inferred_stock_cases}, "
         f"skipped_missing_state={summary.skipped_missing_state}, skipped_missing_action={summary.skipped_missing_action})",
     )

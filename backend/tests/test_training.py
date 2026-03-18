@@ -5,11 +5,14 @@ import numpy as np
 import backend.siesta.training as training_module
 from backend.siesta.game import Card, GameState
 from backend.siesta.training import (
+    best_hole_goal_outcome,
+    benchmark_hole_goal,
     HumanFeedbackSummary,
     NumpyPolicyNetwork,
     TrainingCase,
     blocked_mid_rank_risk,
     benchmark_policies,
+    build_hole_opening_cases,
     build_training_cases,
     build_training_examples,
     choose_search_action,
@@ -18,6 +21,7 @@ from backend.siesta.training import (
     hole_access_score,
     human_case_repeat_factor,
     load_human_feedback_cases,
+    progress_score,
     rank_actions_for_state,
     training_game_seeds,
     top_color_mix_penalty,
@@ -131,6 +135,38 @@ def test_search_prefers_creating_hole_when_available():
     assert action.move.run_length == source_height
 
 
+def test_best_hole_goal_outcome_finds_hole_within_horizon():
+    state = make_state(
+        [
+            [Card(6, "hearts")],
+            [Card(7, "spades")],
+            [Card(9, "clubs")],
+            [Card(10, "diamonds")],
+            [Card(11, "clubs")],
+            [Card(12, "hearts")],
+            [Card(13, "spades")],
+        ]
+    )
+    outcome = best_hole_goal_outcome(state, horizon=1, beam_width=4)
+    assert outcome["reachable"] is True
+    assert outcome["first_hole_depth"] == 1
+    assert outcome["best_empty_columns"] >= 1
+
+
+def test_build_hole_opening_cases_generates_ranked_examples():
+    cases = build_hole_opening_cases(num_games=3, horizon=3, beam_width=4)
+    assert cases
+    assert all(case.source == "hole_opening" for case in cases)
+    assert all(case.features.shape[0] == len(case.action_signatures) for case in cases)
+
+
+def test_benchmark_hole_goal_returns_expected_metrics():
+    result = benchmark_hole_goal(policies=("heuristic", "hole_search"), games=2, horizon=3)
+    assert set(result) == {"heuristic", "hole_search"}
+    assert result["heuristic"]["games"] == 2
+    assert "success_rate" in result["hole_search"]
+
+
 def test_blocked_mid_rank_risk_penalizes_buried_middle_duplicates():
     risky = make_state(
         [
@@ -198,6 +234,32 @@ def test_color_mix_penalty_grows_with_more_mixed_suits():
     assert top_color_mix_penalty(four_suit_mix) > top_color_mix_penalty(two_suit_mix)
 
 
+def test_progress_score_prefers_holes_over_longer_top_run():
+    hole_state = make_state(
+        [
+            [],
+            [Card(7, "spades")],
+            [Card(6, "hearts")],
+            [Card(10, "clubs")],
+            [Card(9, "diamonds")],
+            [Card(8, "clubs")],
+            [Card(5, "hearts")],
+        ]
+    )
+    run_state = make_state(
+        [
+            [Card(8, "spades"), Card(7, "spades"), Card(6, "spades")],
+            [Card(10, "hearts")],
+            [Card(9, "clubs")],
+            [Card(8, "diamonds")],
+            [Card(7, "clubs")],
+            [Card(6, "hearts")],
+            [Card(5, "spades")],
+        ]
+    )
+    assert progress_score(hole_state) > progress_score(run_state)
+
+
 def test_ui_ranking_returns_compact_suggestions():
     state = make_state(
         [
@@ -215,6 +277,35 @@ def test_ui_ranking_returns_compact_suggestions():
     assert len(ranking["suggestions"]) <= 5
     assert ranking["suggestions"]
     assert all("description" in suggestion for suggestion in ranking["suggestions"])
+
+
+def test_ui_ranking_can_use_hole_model_signal_in_opening(monkeypatch):
+    state = make_state(
+        [
+            [Card(6, "hearts")],
+            [Card(7, "spades")],
+            [Card(9, "clubs")],
+            [Card(10, "diamonds")],
+            [Card(11, "clubs")],
+            [Card(12, "hearts")],
+            [Card(13, "spades")],
+        ],
+        stock=[Card(1, "clubs")] * 24,
+    )
+
+    class StubModel:
+        def score(self, batch):
+            return np.linspace(0.0, 1.0, len(batch), dtype=np.float32)
+
+    monkeypatch.setattr(training_module, "load_latest_model", lambda: None)
+    monkeypatch.setattr(training_module, "load_model_metadata", lambda: {})
+    monkeypatch.setattr(training_module, "load_hole_model", lambda: StubModel())
+    monkeypatch.setattr(training_module, "load_hole_model_metadata", lambda: {"ready": True})
+
+    ranking = rank_actions_for_state(state, limit=3)
+    assert ranking["hole_model_active"] is True
+    assert ranking["ranking_source"] == "search+hole"
+    assert any(suggestion.get("hole_model_score") is not None for suggestion in ranking["suggestions"])
 
 
 def test_load_human_feedback_cases_uses_strongest_duplicate(tmp_path):
@@ -379,6 +470,127 @@ def test_load_human_feedback_cases_prioritizes_important_and_key_move(tmp_path):
     assert len(cases) == 3
     assert weights[0] < weights[1] < weights[2]
     assert boosts[0] < boosts[1] < boosts[2]
+
+
+def test_load_human_feedback_cases_weights_won_games_above_conceded(tmp_path):
+    state_snapshot = {
+        "status": "in_progress",
+        "terminal_reason": None,
+        "moves_played": 0,
+        "stock_count": 0,
+        "completed_sequences": 0,
+        "state_hash": "outcome-demo",
+        "columns": [
+            {"index": 0, "cards": [{"rank": 6, "suit": "hearts"}], "movable_run_length": 1, "height": 1},
+            {"index": 1, "cards": [{"rank": 7, "suit": "spades"}], "movable_run_length": 1, "height": 1},
+            {"index": 2, "cards": [], "movable_run_length": 0, "height": 0},
+            {"index": 3, "cards": [], "movable_run_length": 0, "height": 0},
+            {"index": 4, "cards": [], "movable_run_length": 0, "height": 0},
+            {"index": 5, "cards": [], "movable_run_length": 0, "height": 0},
+            {"index": 6, "cards": [], "movable_run_length": 0, "height": 0},
+        ],
+        "stock_cards": [],
+    }
+    rows = [
+        {
+            "record_type": "feedback",
+            "timestamp": "2026-03-14T10:00:00+00:00",
+            "game_id": "won-game",
+            "state_hash": "outcome-demo-won",
+            "feedback_strength": "normal",
+            "chosen_action": {"type": "move", "from_column": 0, "to_column": 1, "run_length": 1},
+            "state_snapshot": {**state_snapshot, "state_hash": "outcome-demo-won"},
+        },
+        {
+            "record_type": "feedback",
+            "timestamp": "2026-03-14T10:00:01+00:00",
+            "game_id": "conceded-game",
+            "state_hash": "outcome-demo-conceded",
+            "feedback_strength": "important",
+            "chosen_action": {"type": "move", "from_column": 0, "to_column": 1, "run_length": 1},
+            "state_snapshot": {**state_snapshot, "state_hash": "outcome-demo-conceded"},
+        },
+    ]
+    path = tmp_path / "human_feedback.jsonl"
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    (sessions_dir / "won-game.json").write_text(
+        json.dumps({"game_id": "won-game", "history": [{"status": "won"}]}),
+        encoding="utf-8",
+    )
+    (sessions_dir / "conceded-game.json").write_text(
+        json.dumps({"game_id": "conceded-game", "history": [{"status": "conceded"}]}),
+        encoding="utf-8",
+    )
+
+    cases, summary = load_human_feedback_cases(path=path, sessions_dir=sessions_dir)
+    weights = sorted(case.weight for case in cases)
+    assert len(cases) == 2
+    assert weights[0] < weights[1]
+    assert summary.won_cases == 1
+    assert summary.conceded_cases == 1
+
+
+def test_load_human_feedback_cases_excludes_normal_from_conceded_games(tmp_path):
+    state_snapshot = {
+        "status": "in_progress",
+        "terminal_reason": None,
+        "moves_played": 0,
+        "stock_count": 0,
+        "completed_sequences": 0,
+        "state_hash": "filter-demo",
+        "columns": [
+            {"index": 0, "cards": [{"rank": 6, "suit": "hearts"}], "movable_run_length": 1, "height": 1},
+            {"index": 1, "cards": [{"rank": 7, "suit": "spades"}], "movable_run_length": 1, "height": 1},
+            {"index": 2, "cards": [], "movable_run_length": 0, "height": 0},
+            {"index": 3, "cards": [], "movable_run_length": 0, "height": 0},
+            {"index": 4, "cards": [], "movable_run_length": 0, "height": 0},
+            {"index": 5, "cards": [], "movable_run_length": 0, "height": 0},
+            {"index": 6, "cards": [], "movable_run_length": 0, "height": 0},
+        ],
+        "stock_cards": [],
+    }
+    rows = [
+        {
+            "record_type": "feedback",
+            "timestamp": "2026-03-14T10:00:00+00:00",
+            "game_id": "conceded-game-normal",
+            "state_hash": "filter-demo-normal",
+            "feedback_strength": "normal",
+            "chosen_action": {"type": "move", "from_column": 0, "to_column": 1, "run_length": 1},
+            "state_snapshot": {**state_snapshot, "state_hash": "filter-demo-normal"},
+        },
+        {
+            "record_type": "feedback",
+            "timestamp": "2026-03-14T10:00:01+00:00",
+            "game_id": "conceded-game-important",
+            "state_hash": "filter-demo-important",
+            "feedback_strength": "important",
+            "chosen_action": {"type": "move", "from_column": 0, "to_column": 1, "run_length": 1},
+            "state_snapshot": {**state_snapshot, "state_hash": "filter-demo-important"},
+        },
+    ]
+    path = tmp_path / "human_feedback.jsonl"
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    (sessions_dir / "conceded-game-normal.json").write_text(
+        json.dumps({"game_id": "conceded-game-normal", "history": [{"status": "conceded"}]}),
+        encoding="utf-8",
+    )
+    (sessions_dir / "conceded-game-important.json").write_text(
+        json.dumps({"game_id": "conceded-game-important", "history": [{"status": "conceded"}]}),
+        encoding="utf-8",
+    )
+
+    cases, summary = load_human_feedback_cases(path=path, sessions_dir=sessions_dir)
+    assert len(cases) == 1
+    assert summary.skipped_normal_conceded_cases == 1
+    assert summary.conceded_cases == 1
+    assert cases[0].weight >= 18.0 * 0.82
 
 
 def test_human_cases_are_repeated_to_gain_training_share():

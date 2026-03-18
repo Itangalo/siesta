@@ -198,7 +198,7 @@ function rankingSource() {
   if (!state.aiContext) {
     return "search";
   }
-  return state.aiContext.modelEligible ? "model" : "search";
+  return state.aiContext.rankingSource || (state.aiContext.modelEligible ? "model" : "search");
 }
 
 function selectedRunLength(columnIndex, cardIndex) {
@@ -272,11 +272,18 @@ function updateFeedbackPanel() {
     pendingPanel.classList.add("hidden");
     pendingText.textContent = "";
   } else {
-    const source = rankingSource() === "model" ? "modellen" : "search-läraren";
+    const sourceMap = {
+      model: "modellen",
+      search: "search-läraren",
+      "model+hole": "modellen + hålmodellen",
+      "search+hole": "search + hålmodellen",
+    };
+    const source = sourceMap[rankingSource()] || rankingSource();
     const top = state.aiContext.suggestions[0];
     const searchPart = top.search_score === null || top.search_score === undefined ? "" : ` | search ${top.search_score.toFixed(1)}`;
     const modelPart = top.model_score === null || top.model_score === undefined ? "" : ` | modell ${top.model_score.toFixed(2)}`;
-    summary.textContent = `Aktiv AI-källa: ${source}. Toppförslag: ${top.description}${searchPart}${modelPart}.`;
+    const holePart = top.hole_model_score === null || top.hole_model_score === undefined ? "" : ` | hål ${top.hole_model_score.toFixed(2)}`;
+    summary.textContent = `Aktiv AI-källa: ${source}. Toppförslag: ${top.description}${searchPart}${modelPart}${holePart}.`;
 
     const candidate = currentPlannedFeedbackEntry();
     if (!candidate || !candidate.topSuggestion || actionKey(candidate.chosenAction) === actionKey(candidate.topSuggestion)) {
@@ -365,7 +372,10 @@ function renderSuggestions() {
   container.className = "suggestions";
   container.innerHTML = state.suggestions
     .map((suggestion) => {
-      const sourceBadge = state.aiContext && state.aiContext.modelEligible ? "modell" : "search";
+      const sourceBadge =
+        state.aiContext && state.aiContext.holeModelActive
+          ? (state.aiContext.modelEligible ? "modell+hål" : "search+hål")
+          : (state.aiContext && state.aiContext.modelEligible ? "modell" : "search");
       const searchPart =
         suggestion.search_score === null || suggestion.search_score === undefined
           ? ""
@@ -374,9 +384,13 @@ function renderSuggestions() {
         suggestion.model_score === null || suggestion.model_score === undefined
           ? ""
           : ` | modell ${suggestion.model_score.toFixed(3)}`;
+      const holePart =
+        suggestion.hole_model_score === null || suggestion.hole_model_score === undefined
+          ? ""
+          : ` | hål ${suggestion.hole_model_score.toFixed(3)}`;
       return `<button class="suggestion-item" data-type="${suggestion.type}" data-from="${suggestion.from_column ?? ""}" data-to="${suggestion.to_column ?? ""}" data-run="${suggestion.run_length ?? ""}">
         <span class="suggestion-main">${suggestion.description}</span>
-        <span class="suggestion-meta">${sourceBadge} | heuristik ${suggestion.heuristic_score.toFixed(1)}${searchPart}${modelPart}</span>
+        <span class="suggestion-meta">${sourceBadge} | heuristik ${suggestion.heuristic_score.toFixed(1)}${searchPart}${modelPart}${holePart}</span>
       </button>`;
     })
     .join("");
@@ -789,6 +803,9 @@ async function loadSuggestions({ silentIfCurrent = false } = {}) {
       suggestions: payload.suggestions,
       modelLoaded: payload.model_loaded,
       modelEligible: payload.model_eligible,
+      holeModelLoaded: payload.hole_model_loaded,
+      holeModelActive: payload.hole_model_active,
+      rankingSource: payload.ranking_source,
     };
     state.feedbackStatus = "";
     render();
