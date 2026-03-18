@@ -42,6 +42,10 @@ DEFAULT_HOLE_MODEL_PATH = MODELS_DIR / "hole-policy-latest.npz"
 DEFAULT_HOLE_METADATA_PATH = MODELS_DIR / "hole-policy-latest.json"
 DEFAULT_HOLE_CANDIDATE_MODEL_PATH = MODELS_DIR / "hole-policy-candidate.npz"
 DEFAULT_HOLE_CANDIDATE_METADATA_PATH = MODELS_DIR / "hole-policy-candidate.json"
+DEFAULT_COMPACT_MODEL_PATH = MODELS_DIR / "compact-policy-latest.npz"
+DEFAULT_COMPACT_METADATA_PATH = MODELS_DIR / "compact-policy-latest.json"
+DEFAULT_COMPACT_CANDIDATE_MODEL_PATH = MODELS_DIR / "compact-policy-candidate.npz"
+DEFAULT_COMPACT_CANDIDATE_METADATA_PATH = MODELS_DIR / "compact-policy-candidate.json"
 DEFAULT_FEEDBACK_PATH = DATA_DIR / "human_feedback.jsonl"
 DEFAULT_SEARCH_DEPTH = 2
 DEFAULT_SEARCH_BEAM_WIDTH = 4
@@ -70,6 +74,8 @@ DEFAULT_HUMAN_TARGET_SHARE = 0.18
 DEFAULT_MAX_HUMAN_REPEAT_FACTOR = 32
 DEFAULT_HOLE_GOAL_HORIZON = 5
 DEFAULT_HOLE_GOAL_BEAM_WIDTH = 6
+DEFAULT_COMPACT_GOAL_HORIZON = 5
+DEFAULT_COMPACT_GOAL_BEAM_WIDTH = 6
 ProgressCallback = Optional[Callable[[str], None]]
 
 
@@ -186,6 +192,33 @@ def top_stair_length(column: Sequence[Card]) -> int:
 
 def empty_column_count(state: GameState) -> int:
     return sum(1 for column in state.columns if not column)
+
+
+def effective_column_units(column: Sequence[Card]) -> int:
+    if not column:
+        return 0
+    units = 1
+    for index in range(1, len(column)):
+        lower = column[index - 1]
+        upper = column[index]
+        if not (lower.suit == upper.suit and lower.rank == upper.rank + 1):
+            units += 1
+    return units
+
+
+def effective_column_mass(state: GameState) -> int:
+    return sum(effective_column_units(column) for column in state.columns)
+
+
+def mixed_stair_bonus(state: GameState) -> float:
+    bonus = 0.0
+    for column in state.columns:
+        for index in range(1, len(column)):
+            lower = column[index - 1]
+            upper = column[index]
+            if lower.rank == upper.rank + 1 and lower.suit != upper.suit:
+                bonus += 0.35
+    return bonus
 
 
 def hole_setup_score(state: GameState) -> float:
@@ -394,6 +427,88 @@ def hole_goal_state_score(state: GameState) -> float:
     return score
 
 
+def compact_goal_hole_bonus(empty_columns: int) -> float:
+    if empty_columns <= 0:
+        return 0.0
+    bonus = 130.0
+    if empty_columns >= 2:
+        bonus += 180.0
+    if empty_columns >= 3:
+        bonus += 90.0 * (empty_columns - 2)
+    return bonus
+
+
+def compactness_goal_state_score(state: GameState) -> float:
+    empty_columns = empty_column_count(state)
+    score = 0.0
+    if state.status == STATUS_WON:
+        score += 600.0
+    score += compact_goal_hole_bonus(empty_columns)
+    score += 12.0 * (52 - effective_column_mass(state))
+    score += 3.0 * hole_access_score(state)
+    score += 1.5 * hole_setup_score(state)
+    score += 4.0 * mixed_stair_bonus(state)
+    return score
+
+
+def _beam_states_for_compact_goal(states: Sequence[Tuple[GameState, int]], beam_width: int) -> List[Tuple[GameState, int]]:
+    ranked = sorted(states, key=lambda item: compactness_goal_state_score(item[0]), reverse=True)
+    selected: List[Tuple[GameState, int]] = []
+    seen_hashes = set()
+    for state, depth in ranked:
+        if state.state_hash in seen_hashes:
+            continue
+        selected.append((state, depth))
+        seen_hashes.add(state.state_hash)
+        if len(selected) >= beam_width:
+            break
+    return selected
+
+
+def best_compact_goal_outcome(
+    state: GameState,
+    horizon: int = DEFAULT_COMPACT_GOAL_HORIZON,
+    beam_width: int = DEFAULT_COMPACT_GOAL_BEAM_WIDTH,
+) -> Dict[str, Any]:
+    best_score = compactness_goal_state_score(state)
+    best_empty = empty_column_count(state)
+    min_effective_mass = effective_column_mass(state)
+    first_hole_depth = 0 if best_empty > 0 else None
+    frontier: List[Tuple[GameState, int]] = [(state, 0)]
+    seen_depths = {state.state_hash: 0}
+
+    for _ in range(horizon):
+        expanded: List[Tuple[GameState, int]] = []
+        for current_state, depth in frontier:
+            current_empty = empty_column_count(current_state)
+            best_empty = max(best_empty, current_empty)
+            min_effective_mass = min(min_effective_mass, effective_column_mass(current_state))
+            best_score = max(best_score, compactness_goal_state_score(current_state))
+            if current_empty > 0 and first_hole_depth is None:
+                first_hole_depth = depth
+            if depth >= horizon or current_state.status != STATUS_IN_PROGRESS:
+                continue
+            for action in available_actions(current_state):
+                next_state = apply_action(current_state, action)
+                next_depth = depth + 1
+                previous_depth = seen_depths.get(next_state.state_hash)
+                if previous_depth is not None and previous_depth <= next_depth:
+                    continue
+                seen_depths[next_state.state_hash] = next_depth
+                expanded.append((next_state, next_depth))
+        if not expanded:
+            break
+        frontier = _beam_states_for_compact_goal(expanded, beam_width=beam_width)
+
+    return {
+        "reachable": first_hole_depth is not None,
+        "first_hole_depth": first_hole_depth,
+        "best_empty_columns": best_empty,
+        "min_effective_mass": min_effective_mass,
+        "best_score": best_score,
+    }
+
+
 def _beam_states_for_hole_goal(states: Sequence[Tuple[GameState, int]], beam_width: int) -> List[Tuple[GameState, int]]:
     ranked = sorted(states, key=lambda item: hole_goal_state_score(item[0]), reverse=True)
     selected: List[Tuple[GameState, int]] = []
@@ -504,6 +619,35 @@ def choose_hole_search_action(
     beam_width: int = DEFAULT_HOLE_GOAL_BEAM_WIDTH,
 ) -> Optional[Action]:
     ranked = rank_hole_search_actions(state, horizon=horizon, beam_width=beam_width)
+    return ranked[0][1] if ranked else None
+
+
+def rank_compact_search_actions(
+    state: GameState,
+    horizon: int = DEFAULT_COMPACT_GOAL_HORIZON,
+    beam_width: int = DEFAULT_COMPACT_GOAL_BEAM_WIDTH,
+) -> List[Tuple[float, Action]]:
+    actions = available_actions(state)
+    ranked: List[Tuple[float, Action]] = []
+    for action in actions:
+        next_state = apply_action(state, action)
+        outcome = best_compact_goal_outcome(next_state, horizon=max(0, horizon - 1), beam_width=beam_width)
+        score = outcome["best_score"]
+        if outcome["reachable"]:
+            depth = outcome["first_hole_depth"] if outcome["first_hole_depth"] is not None else horizon
+            score += max(0.0, 18.0 - 3.0 * depth)
+        score += 0.35 * evaluate_action(state, action)
+        ranked.append((score, action))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return ranked
+
+
+def choose_compact_search_action(
+    state: GameState,
+    horizon: int = DEFAULT_COMPACT_GOAL_HORIZON,
+    beam_width: int = DEFAULT_COMPACT_GOAL_BEAM_WIDTH,
+) -> Optional[Action]:
+    ranked = rank_compact_search_actions(state, horizon=horizon, beam_width=beam_width)
     return ranked[0][1] if ranked else None
 
 
@@ -649,6 +793,28 @@ def rank_search_actions(
         ranked.append((score, action))
     ranked.sort(key=lambda item: item[0], reverse=True)
     return ranked
+
+
+def rank_teacher_search_actions(
+    state: GameState,
+    depth: int = DEFAULT_SEARCH_DEPTH,
+    beam_width: int = DEFAULT_SEARCH_BEAM_WIDTH,
+    discount: float = DEFAULT_SEARCH_DISCOUNT,
+    rollout_steps: int = DEFAULT_SEARCH_ROLLOUT_STEPS,
+) -> List[Tuple[float, Action]]:
+    if should_use_hole_opening_signal(state):
+        return rank_hole_search_actions(
+            state,
+            horizon=DEFAULT_HOLE_GOAL_HORIZON,
+            beam_width=DEFAULT_HOLE_GOAL_BEAM_WIDTH,
+        )
+    return rank_search_actions(
+        state,
+        depth=depth,
+        beam_width=beam_width,
+        discount=discount,
+        rollout_steps=rollout_steps,
+    )
 
 
 def rank_search_actions_subset(
@@ -1015,7 +1181,7 @@ def build_training_cases(
                 if not actions:
                     break
                 if teacher_policy == "search":
-                    ranked_actions = rank_search_actions(
+                    ranked_actions = rank_teacher_search_actions(
                         state,
                         depth=search_depth,
                         beam_width=beam_width,
@@ -1160,6 +1326,60 @@ def build_hole_opening_cases(
     return cases
 
 
+def build_compact_opening_cases(
+    num_games: int = 60,
+    seed_offset: int = 0,
+    horizon: int = DEFAULT_COMPACT_GOAL_HORIZON,
+    beam_width: int = DEFAULT_COMPACT_GOAL_BEAM_WIDTH,
+    progress: ProgressCallback = None,
+) -> List[TrainingCase]:
+    cases: List[TrainingCase] = []
+    game_seeds = training_game_seeds(num_games=num_games, seed_offset=seed_offset)
+    progress_every = max(1, num_games // 10)
+    emit_progress(progress, f"[compact-data] generating opening cases from {num_games} games")
+
+    for game_index, game_seed in enumerate(game_seeds, start=1):
+        state = create_game(seed=game_seed)
+        actions = available_actions(state)
+        if not actions:
+            continue
+        ranked_actions = rank_compact_search_actions(state, horizon=horizon, beam_width=beam_width)
+        if not ranked_actions:
+            continue
+        chosen = ranked_actions[0][1]
+        ranked_map = {action_signature(state, action): score for score, action in ranked_actions}
+        signatures = [action_signature(state, action) for action in actions]
+        chosen_signature = action_signature(state, chosen)
+        target_index = signatures.index(chosen_signature)
+        soft_targets = teacher_soft_targets(signatures, ranked_map)
+        best_outcome = best_compact_goal_outcome(apply_action(state, chosen), horizon=max(0, horizon - 1), beam_width=beam_width)
+        weight = 1.0
+        if best_outcome["reachable"]:
+            weight += 1.25
+        if best_outcome["best_empty_columns"] >= 2:
+            weight += 0.75
+        if best_outcome["min_effective_mass"] <= effective_column_mass(state) - 2:
+            weight += 0.5
+        cases.append(
+            TrainingCase(
+                features=np.vstack([encode_action(state, action) for action in actions]),
+                target_index=target_index,
+                weight=weight,
+                chosen_signature=chosen_signature,
+                action_signatures=signatures,
+                soft_targets=soft_targets,
+                target_boost=0.86,
+                source="compact_opening",
+            )
+        )
+        if game_index % progress_every == 0 or game_index == num_games:
+            emit_progress(progress, f"[compact-data] processed {game_index}/{num_games} games, cases={len(cases)}")
+
+    if not cases:
+        raise RuntimeError("No compact-opening examples were generated.")
+    return cases
+
+
 def train_policy_model(
     num_games: int = 60,
     epochs: int = 30,
@@ -1288,6 +1508,16 @@ def promote_hole_candidate_checkpoint(candidate_metadata: Dict[str, Any]) -> Non
     DEFAULT_HOLE_METADATA_PATH.write_text(json.dumps(candidate_metadata, indent=2), encoding="utf-8")
 
 
+def save_compact_candidate_checkpoint(model: "NumpyPolicyNetwork", metadata: Dict[str, Any]) -> None:
+    model.save(DEFAULT_COMPACT_CANDIDATE_MODEL_PATH)
+    DEFAULT_COMPACT_CANDIDATE_METADATA_PATH.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+
+def promote_compact_candidate_checkpoint(candidate_metadata: Dict[str, Any]) -> None:
+    shutil.copyfile(DEFAULT_COMPACT_CANDIDATE_MODEL_PATH, DEFAULT_COMPACT_MODEL_PATH)
+    DEFAULT_COMPACT_METADATA_PATH.write_text(json.dumps(candidate_metadata, indent=2), encoding="utf-8")
+
+
 def train_hole_opening_model(
     num_games: int = 120,
     epochs: int = 30,
@@ -1374,6 +1604,93 @@ def train_hole_opening_model(
     }
 
 
+def train_compact_opening_model(
+    num_games: int = 120,
+    epochs: int = 30,
+    learning_rate: float = 0.02,
+    hidden_dim: int = 64,
+    benchmark_games: int = 50,
+    horizon: int = DEFAULT_COMPACT_GOAL_HORIZON,
+    beam_width: int = DEFAULT_COMPACT_GOAL_BEAM_WIDTH,
+    progress: ProgressCallback = None,
+) -> Dict[str, Any]:
+    cases = build_compact_opening_cases(
+        num_games=num_games,
+        horizon=horizon,
+        beam_width=beam_width,
+        progress=progress,
+    )
+    benchmark_seeds = list(range(benchmark_games))
+    active_model_before = load_compact_model()
+    model = NumpyPolicyNetwork(input_dim=cases[0].features.shape[1], hidden_dim=hidden_dim)
+    emit_progress(progress, f"[compact-train] training on {len(cases)} opening states")
+    metrics = model.train_ranked(cases, epochs=epochs, learning_rate=learning_rate, progress=progress)
+
+    heuristic_eval = benchmark_compact_goal(
+        policies=("heuristic",),
+        games=benchmark_games,
+        horizon=horizon,
+        beam_width=beam_width,
+        progress=progress,
+    )["heuristic"]
+    search_eval = benchmark_compact_goal(
+        policies=("search", "hole_search", "compact_search"),
+        games=benchmark_games,
+        horizon=horizon,
+        beam_width=beam_width,
+        progress=progress,
+    )
+    candidate_eval = evaluate_compact_goal(
+        policy="model",
+        seeds=benchmark_seeds,
+        model=model,
+        horizon=horizon,
+        beam_width=beam_width,
+        progress=progress,
+    )
+    active_eval_before = None
+    if active_model_before is not None:
+        active_eval_before = evaluate_compact_goal(
+            policy="model",
+            seeds=benchmark_seeds,
+            model=active_model_before,
+            horizon=horizon,
+            beam_width=beam_width,
+            progress=progress,
+        )
+
+    promoted_to_active = _hole_model_is_better(candidate_eval, active_eval_before)
+    active_eval = candidate_eval if promoted_to_active or active_eval_before is None else active_eval_before
+    metadata = {
+        "num_games": num_games,
+        "epochs": epochs,
+        "learning_rate": learning_rate,
+        "hidden_dim": hidden_dim,
+        "benchmark_games": benchmark_games,
+        "horizon": horizon,
+        "beam_width": beam_width,
+        "training_cases": len(cases),
+        "metrics": metrics,
+        "heuristic_compact_evaluation": heuristic_eval,
+        "search_compact_evaluation": search_eval["search"],
+        "hole_search_compact_evaluation": search_eval["hole_search"],
+        "compact_search_evaluation": search_eval["compact_search"],
+        "candidate_model_evaluation": candidate_eval,
+        "active_model_before_evaluation": active_eval_before,
+        "active_model_evaluation": active_eval,
+        "model_evaluation": active_eval,
+        "promoted_to_active": promoted_to_active,
+    }
+    save_compact_candidate_checkpoint(model, metadata)
+    if promoted_to_active:
+        promote_compact_candidate_checkpoint(metadata)
+    return {
+        "model_path": str(DEFAULT_COMPACT_MODEL_PATH),
+        "candidate_model_path": str(DEFAULT_COMPACT_CANDIDATE_MODEL_PATH),
+        **metadata,
+    }
+
+
 def load_latest_model() -> Optional[NumpyPolicyNetwork]:
     if not DEFAULT_MODEL_PATH.exists():
         return None
@@ -1402,6 +1719,21 @@ def load_hole_model_metadata() -> Dict[str, Any]:
     if not DEFAULT_HOLE_METADATA_PATH.exists():
         return {}
     return json.loads(DEFAULT_HOLE_METADATA_PATH.read_text(encoding="utf-8"))
+
+
+def load_compact_model() -> Optional[NumpyPolicyNetwork]:
+    if not DEFAULT_COMPACT_MODEL_PATH.exists():
+        return None
+    model = NumpyPolicyNetwork.load(DEFAULT_COMPACT_MODEL_PATH)
+    if model.input_dim != current_input_dim():
+        return None
+    return model
+
+
+def load_compact_model_metadata() -> Dict[str, Any]:
+    if not DEFAULT_COMPACT_METADATA_PATH.exists():
+        return {}
+    return json.loads(DEFAULT_COMPACT_METADATA_PATH.read_text(encoding="utf-8"))
 
 
 def choose_model_action(state: GameState, model: NumpyPolicyNetwork) -> Optional[Action]:
@@ -1548,6 +1880,145 @@ def benchmark_hole_goal(
     return benchmark
 
 
+def play_compact_goal_episode(
+    policy: str,
+    seed: int,
+    model: Optional[NumpyPolicyNetwork] = None,
+    horizon: int = DEFAULT_COMPACT_GOAL_HORIZON,
+    beam_width: int = DEFAULT_COMPACT_GOAL_BEAM_WIDTH,
+    progress: ProgressCallback = None,
+) -> Dict[str, Any]:
+    state = create_game(seed=seed)
+    best_empty = empty_column_count(state)
+    min_mass = effective_column_mass(state)
+    best_score = compactness_goal_state_score(state)
+    first_hole_depth = 0 if best_empty > 0 else None
+    rng = random.Random(seed + 5000)
+
+    for depth in range(horizon):
+        if empty_column_count(state) > 0 and first_hole_depth is None:
+            first_hole_depth = depth
+        if state.status != STATUS_IN_PROGRESS:
+            break
+        action = choose_policy_action(
+            state,
+            policy=policy,
+            rng=rng,
+            model=model,
+        )
+        if action is None:
+            break
+        if policy == "compact_search":
+            action = choose_compact_search_action(state, horizon=max(1, horizon - depth), beam_width=beam_width)
+            if action is None:
+                break
+        state = apply_action(state, action)
+        best_empty = max(best_empty, empty_column_count(state))
+        min_mass = min(min_mass, effective_column_mass(state))
+        best_score = max(best_score, compactness_goal_state_score(state))
+        if empty_column_count(state) > 0 and first_hole_depth is None:
+            first_hole_depth = depth + 1
+
+    label = f"compact-game seed={seed}"
+    emit_progress(
+        progress,
+        f"[compact-eval:{policy}] {label} success={first_hole_depth is not None} best_empty={best_empty} min_mass={min_mass}",
+    )
+    return {
+        "seed": seed,
+        "success": first_hole_depth is not None,
+        "first_hole_depth": first_hole_depth,
+        "best_empty_columns": best_empty,
+        "min_effective_mass": min_mass,
+        "best_score": best_score,
+    }
+
+
+def evaluate_compact_goal(
+    policy: str = "heuristic",
+    seeds: Optional[Sequence[int]] = None,
+    model: Optional[NumpyPolicyNetwork] = None,
+    horizon: int = DEFAULT_COMPACT_GOAL_HORIZON,
+    beam_width: int = DEFAULT_COMPACT_GOAL_BEAM_WIDTH,
+    progress: ProgressCallback = None,
+) -> Dict[str, Any]:
+    if policy == "model" and model is None:
+        model = load_compact_model()
+    if policy == "model" and model is None:
+        emit_progress(progress, "[compact-eval:model] no compatible model checkpoint found")
+        return {
+            "policy": policy,
+            "games": 0,
+            "success_rate": 0.0,
+            "average_best_empty_columns": 0.0,
+            "average_first_hole_depth": float(horizon + 1),
+            "average_min_effective_mass": 52.0,
+            "average_best_score": 0.0,
+            "episodes": [],
+            "available": False,
+        }
+    seeds = list(seeds or range(20))
+    episodes = []
+    report_every = max(1, len(seeds) // 5)
+    emit_progress(progress, f"[compact-eval:{policy}] running {len(seeds)} games horizon={horizon}")
+    for index, seed in enumerate(seeds, start=1):
+        episodes.append(
+            play_compact_goal_episode(
+                policy=policy,
+                seed=seed,
+                model=model,
+                horizon=horizon,
+                beam_width=beam_width,
+                progress=progress,
+            )
+        )
+        if index % report_every == 0 or index == len(seeds):
+            success_rate = sum(1 for episode in episodes if episode["success"]) / len(episodes)
+            emit_progress(progress, f"[compact-eval:{policy}] completed {index}/{len(seeds)} games success_rate={success_rate:.2f}")
+
+    successful_depths = [episode["first_hole_depth"] for episode in episodes if episode["first_hole_depth"] is not None]
+    average_depth = float(sum(successful_depths) / len(successful_depths)) if successful_depths else float(horizon + 1)
+    return {
+        "policy": policy,
+        "games": len(episodes),
+        "success_rate": sum(1 for episode in episodes if episode["success"]) / len(episodes),
+        "average_best_empty_columns": float(sum(episode["best_empty_columns"] for episode in episodes) / len(episodes)),
+        "average_first_hole_depth": average_depth,
+        "average_min_effective_mass": float(sum(episode["min_effective_mass"] for episode in episodes) / len(episodes)),
+        "average_best_score": float(sum(episode["best_score"] for episode in episodes) / len(episodes)),
+        "episodes": episodes,
+    }
+
+
+def benchmark_compact_goal(
+    policies: Sequence[str] = ("heuristic", "search", "hole_search", "compact_search", "model"),
+    games: int = 20,
+    horizon: int = DEFAULT_COMPACT_GOAL_HORIZON,
+    beam_width: int = DEFAULT_COMPACT_GOAL_BEAM_WIDTH,
+    model: Optional[NumpyPolicyNetwork] = None,
+    progress: ProgressCallback = None,
+) -> Dict[str, Dict[str, Any]]:
+    benchmark: Dict[str, Dict[str, Any]] = {}
+    seeds = list(range(games))
+    for policy in policies:
+        loaded_model = model
+        if policy == "model" and loaded_model is None:
+            loaded_model = load_compact_model()
+        benchmark[policy] = {
+            key: value
+            for key, value in evaluate_compact_goal(
+                policy=policy,
+                seeds=seeds,
+                model=loaded_model,
+                horizon=horizon,
+                beam_width=beam_width,
+                progress=progress,
+            ).items()
+            if key != "episodes"
+        }
+    return benchmark
+
+
 def _rank_weight_map(
     ranked_pairs: Sequence[Tuple[float, Action]],
     state: GameState,
@@ -1568,6 +2039,16 @@ def should_use_hole_opening_signal(state: GameState) -> bool:
         and state.completed_sequences == 0
         and empty_column_count(state) == 0
         and len(state.stock) >= 17
+    )
+
+
+def should_use_compact_opening_signal(state: GameState) -> bool:
+    return (
+        state.status == STATUS_IN_PROGRESS
+        and state.moves_played <= 4
+        and state.completed_sequences == 0
+        and empty_column_count(state) <= 1
+        and len(state.stock) >= 14
     )
 
 
@@ -1595,6 +2076,8 @@ def choose_policy_action(
         )
     if policy == "hole_search":
         return choose_hole_search_action(state)
+    if policy == "compact_search":
+        return choose_compact_search_action(state)
     if policy == "model" and model is not None:
         return choose_model_action(state, model)
     return choose_heuristic_action(state, rng=rng)
@@ -1848,6 +2331,10 @@ def rank_actions_for_state(state: GameState, limit: int = 5) -> Dict[str, Any]:
     hole_metadata = load_hole_model_metadata()
     hole_model_eligible = bool(hole_model is not None and hole_metadata)
     hole_model_scores: Dict[str, float] = {}
+    compact_model = load_compact_model()
+    compact_metadata = load_compact_model_metadata()
+    compact_model_eligible = bool(compact_model is not None and compact_metadata)
+    compact_model_scores: Dict[str, float] = {}
     if model is not None and actions:
         features = np.vstack([encode_action(state, action) for action in actions])
         predictions = model.score(features)
@@ -1860,6 +2347,13 @@ def rank_actions_for_state(state: GameState, limit: int = 5) -> Dict[str, Any]:
         predictions = hole_model.score(features)
         for action, score in zip(actions, predictions):
             hole_model_scores[action.to_dict(state)["description"]] = float(score)
+
+    opening_compact_signal_active = bool(compact_model_eligible and should_use_compact_opening_signal(state))
+    if opening_compact_signal_active and compact_model is not None and actions:
+        features = np.vstack([encode_action(state, action) for action in actions])
+        predictions = compact_model.score(features)
+        for action, score in zip(actions, predictions):
+            compact_model_scores[action.to_dict(state)["description"]] = float(score)
 
     base_ranked = list(heuristic_ranked)
     if model_eligible:
@@ -1884,6 +2378,22 @@ def rank_actions_for_state(state: GameState, limit: int = 5) -> Dict[str, Any]:
             reverse=True,
         )
 
+    if opening_compact_signal_active and compact_model_scores:
+        base_rank_weights = _rank_weight_map(base_ranked, state)
+        compact_ranked = sorted(
+            ((compact_model_scores.get(action_signature(state, action), -1.0), action) for _, action in base_ranked),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        compact_rank_weights = _rank_weight_map(compact_ranked, state)
+        base_ranked.sort(
+            key=lambda item: (
+                base_rank_weights.get(action_signature(state, item[1]), 0.0)
+                + 0.7 * compact_rank_weights.get(action_signature(state, item[1]), 0.0)
+            ),
+            reverse=True,
+        )
+
     ranked: List[Dict[str, Any]] = []
     for heuristic_score, action in base_ranked[:limit]:
         action_dict = action.to_dict(state)
@@ -1894,17 +2404,22 @@ def rank_actions_for_state(state: GameState, limit: int = 5) -> Dict[str, Any]:
                 "search_score": search_scores.get(action_dict["description"]),
                 "model_score": model_scores.get(action_dict["description"]),
                 "hole_model_score": hole_model_scores.get(action_dict["description"]),
+                "compact_model_score": compact_model_scores.get(action_dict["description"]),
             }
         )
     ranking_source = "model" if model_eligible else "search"
     if opening_hole_signal_active and hole_model_scores:
         ranking_source = f"{ranking_source}+hole"
+    if opening_compact_signal_active and compact_model_scores:
+        ranking_source = f"{ranking_source}+compact"
     return {
         "suggestions": ranked,
         "model_loaded": model is not None,
         "model_eligible": model_eligible,
         "hole_model_loaded": hole_model is not None,
         "hole_model_active": opening_hole_signal_active and bool(hole_model_scores),
+        "compact_model_loaded": compact_model is not None,
+        "compact_model_active": opening_compact_signal_active and bool(compact_model_scores),
         "ranking_source": ranking_source,
     }
 

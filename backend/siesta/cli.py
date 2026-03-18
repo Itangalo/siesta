@@ -7,13 +7,17 @@ from pathlib import Path
 import numpy as np
 
 from .training import (
+    benchmark_compact_goal,
     benchmark_policies,
     benchmark_hole_goal,
     build_training_examples,
+    evaluate_compact_goal,
     evaluate_policy,
     evaluate_hole_goal,
+    load_compact_model,
     load_latest_model,
     load_hole_model,
+    train_compact_opening_model,
     train_hole_opening_model,
     train_policy_model,
 )
@@ -84,6 +88,36 @@ def command_benchmark_hole_goal(args: argparse.Namespace) -> None:
     print(json.dumps(strip_episodes(result), indent=2))
 
 
+def command_evaluate_compact_goal(args: argparse.Namespace) -> None:
+    model = load_compact_model() if args.policy == "model" else None
+    result = evaluate_compact_goal(
+        policy=args.policy,
+        model=model,
+        seeds=range(args.games),
+        horizon=args.horizon,
+        progress=console_progress,
+    )
+    print(json.dumps(strip_episodes(result), indent=2))
+
+
+def command_benchmark_compact_goal(args: argparse.Namespace) -> None:
+    result = benchmark_compact_goal(games=args.games, horizon=args.horizon, progress=console_progress)
+    print(json.dumps(strip_episodes(result), indent=2))
+
+
+def command_train_compact_policy(args: argparse.Namespace) -> None:
+    result = train_compact_opening_model(
+        num_games=args.games,
+        epochs=args.epochs,
+        learning_rate=args.learning_rate,
+        hidden_dim=args.hidden_dim,
+        benchmark_games=args.benchmark_games,
+        horizon=args.horizon,
+        progress=console_progress,
+    )
+    print(json.dumps(strip_episodes(result), indent=2))
+
+
 def command_train_hole_policy(args: argparse.Namespace) -> None:
     result = train_hole_opening_model(
         num_games=args.games,
@@ -135,6 +169,26 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark_hole.add_argument("--games", type=int, default=20)
     benchmark_hole.add_argument("--horizon", type=int, default=5)
     benchmark_hole.set_defaults(func=command_benchmark_hole_goal)
+
+    evaluate_compact = subparsers.add_parser("evaluate-compact-goal")
+    evaluate_compact.add_argument("--policy", choices=["heuristic", "random", "search", "hole_search", "compact_search", "model"], default="heuristic")
+    evaluate_compact.add_argument("--games", type=int, default=20)
+    evaluate_compact.add_argument("--horizon", type=int, default=5)
+    evaluate_compact.set_defaults(func=command_evaluate_compact_goal)
+
+    benchmark_compact = subparsers.add_parser("benchmark-compact-goal")
+    benchmark_compact.add_argument("--games", type=int, default=20)
+    benchmark_compact.add_argument("--horizon", type=int, default=5)
+    benchmark_compact.set_defaults(func=command_benchmark_compact_goal)
+
+    train_compact = subparsers.add_parser("train-compact-policy")
+    train_compact.add_argument("--games", type=int, default=120)
+    train_compact.add_argument("--epochs", type=int, default=30)
+    train_compact.add_argument("--learning-rate", type=float, default=0.02)
+    train_compact.add_argument("--hidden-dim", type=int, default=64)
+    train_compact.add_argument("--benchmark-games", type=int, default=50)
+    train_compact.add_argument("--horizon", type=int, default=5)
+    train_compact.set_defaults(func=command_train_compact_policy)
 
     train_hole = subparsers.add_parser("train-hole-policy")
     train_hole.add_argument("--games", type=int, default=120)

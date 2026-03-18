@@ -6,16 +6,21 @@ import backend.siesta.training as training_module
 from backend.siesta.game import Card, GameState
 from backend.siesta.training import (
     best_hole_goal_outcome,
+    benchmark_compact_goal,
     benchmark_hole_goal,
     HumanFeedbackSummary,
     NumpyPolicyNetwork,
     TrainingCase,
     blocked_mid_rank_risk,
     benchmark_policies,
+    build_compact_opening_cases,
     build_hole_opening_cases,
     build_training_cases,
     build_training_examples,
     choose_search_action,
+    compactness_goal_state_score,
+    effective_column_mass,
+    effective_column_units,
     expand_human_cases_for_training,
     evaluate_policy,
     hole_access_score,
@@ -94,6 +99,50 @@ def test_training_cases_capture_ranked_choice():
     assert all(abs(float(case.soft_targets.sum()) - 1.0) < 1e-5 for case in cases)
 
 
+def test_rank_teacher_search_actions_uses_hole_search_for_opening(monkeypatch):
+    state = make_state(
+        [
+            [Card(6, "hearts")],
+            [Card(7, "spades")],
+            [Card(8, "clubs")],
+            [Card(9, "diamonds")],
+            [Card(10, "clubs")],
+            [Card(11, "hearts")],
+            [Card(12, "spades")],
+        ]
+    )
+    sentinel = object()
+
+    monkeypatch.setattr(training_module, "should_use_hole_opening_signal", lambda current_state: current_state is state)
+    monkeypatch.setattr(training_module, "rank_hole_search_actions", lambda *args, **kwargs: sentinel)
+
+    ranked = training_module.rank_teacher_search_actions(state)
+
+    assert ranked is sentinel
+
+
+def test_rank_teacher_search_actions_falls_back_to_regular_search(monkeypatch):
+    state = make_state(
+        [
+            [Card(6, "hearts")],
+            [Card(7, "spades")],
+            [Card(8, "clubs")],
+            [Card(9, "diamonds")],
+            [Card(10, "clubs")],
+            [Card(11, "hearts")],
+            [Card(12, "spades")],
+        ]
+    )
+    sentinel = object()
+
+    monkeypatch.setattr(training_module, "should_use_hole_opening_signal", lambda current_state: False)
+    monkeypatch.setattr(training_module, "rank_search_actions", lambda *args, **kwargs: sentinel)
+
+    ranked = training_module.rank_teacher_search_actions(state)
+
+    assert ranked is sentinel
+
+
 def test_search_policy_evaluation_and_benchmark_work():
     evaluation = evaluate_policy(
         policy="search",
@@ -160,11 +209,25 @@ def test_build_hole_opening_cases_generates_ranked_examples():
     assert all(case.features.shape[0] == len(case.action_signatures) for case in cases)
 
 
+def test_build_compact_opening_cases_generates_ranked_examples():
+    cases = build_compact_opening_cases(num_games=3, horizon=3, beam_width=4)
+    assert cases
+    assert all(case.source == "compact_opening" for case in cases)
+    assert all(case.features.shape[0] == len(case.action_signatures) for case in cases)
+
+
 def test_benchmark_hole_goal_returns_expected_metrics():
     result = benchmark_hole_goal(policies=("heuristic", "hole_search"), games=2, horizon=3)
     assert set(result) == {"heuristic", "hole_search"}
     assert result["heuristic"]["games"] == 2
     assert "success_rate" in result["hole_search"]
+
+
+def test_benchmark_compact_goal_returns_expected_metrics():
+    result = benchmark_compact_goal(policies=("heuristic", "compact_search"), games=2, horizon=3)
+    assert set(result) == {"heuristic", "compact_search"}
+    assert result["heuristic"]["games"] == 2
+    assert "average_min_effective_mass" in result["compact_search"]
 
 
 def test_blocked_mid_rank_risk_penalizes_buried_middle_duplicates():
@@ -206,6 +269,78 @@ def test_hole_access_score_rewards_states_near_creating_hole():
         ]
     )
     assert hole_access_score(state) > 0.0
+
+
+def test_effective_column_units_counts_same_suit_runs_as_one_unit():
+    compact_column = [Card(8, "hearts"), Card(7, "hearts"), Card(6, "hearts"), Card(5, "spades"), Card(4, "spades")]
+    mixed_column = [Card(8, "hearts"), Card(7, "spades"), Card(6, "hearts"), Card(5, "spades"), Card(4, "spades")]
+    assert effective_column_units(compact_column) == 2
+    assert effective_column_units(mixed_column) == 4
+
+
+def test_compactness_goal_prefers_lower_effective_mass_without_hole_bonus():
+    compact_state = make_state(
+        [
+            [Card(8, "hearts"), Card(7, "hearts"), Card(6, "hearts")],
+            [Card(5, "spades"), Card(4, "spades")],
+            [],
+            [],
+            [],
+            [],
+            [],
+        ]
+    )
+    messy_state = make_state(
+        [
+            [Card(8, "hearts"), Card(7, "spades"), Card(6, "hearts")],
+            [Card(5, "spades"), Card(4, "clubs")],
+            [],
+            [],
+            [],
+            [],
+            [],
+        ]
+    )
+    assert effective_column_mass(compact_state) < effective_column_mass(messy_state)
+    assert compactness_goal_state_score(compact_state) > compactness_goal_state_score(messy_state)
+
+
+def test_compactness_goal_gives_weak_credit_for_mixed_stairs():
+    same_suit_state = make_state(
+        [
+            [Card(8, "hearts"), Card(7, "hearts"), Card(6, "hearts")],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+        ]
+    )
+    mixed_stair_state = make_state(
+        [
+            [Card(8, "hearts"), Card(7, "spades"), Card(6, "hearts")],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+        ]
+    )
+    broken_state = make_state(
+        [
+            [Card(8, "hearts"), Card(7, "spades"), Card(5, "hearts")],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+        ]
+    )
+    assert compactness_goal_state_score(same_suit_state) > compactness_goal_state_score(mixed_stair_state)
+    assert compactness_goal_state_score(mixed_stair_state) > compactness_goal_state_score(broken_state)
 
 
 def test_color_mix_penalty_grows_with_more_mixed_suits():
@@ -301,11 +436,44 @@ def test_ui_ranking_can_use_hole_model_signal_in_opening(monkeypatch):
     monkeypatch.setattr(training_module, "load_model_metadata", lambda: {})
     monkeypatch.setattr(training_module, "load_hole_model", lambda: StubModel())
     monkeypatch.setattr(training_module, "load_hole_model_metadata", lambda: {"ready": True})
+    monkeypatch.setattr(training_module, "load_compact_model", lambda: None)
+    monkeypatch.setattr(training_module, "load_compact_model_metadata", lambda: {})
 
     ranking = rank_actions_for_state(state, limit=3)
     assert ranking["hole_model_active"] is True
     assert ranking["ranking_source"] == "search+hole"
     assert any(suggestion.get("hole_model_score") is not None for suggestion in ranking["suggestions"])
+
+
+def test_ui_ranking_can_use_compact_model_signal_in_opening(monkeypatch):
+    state = make_state(
+        [
+            [Card(6, "hearts")],
+            [Card(7, "spades")],
+            [Card(9, "clubs")],
+            [Card(10, "diamonds")],
+            [Card(11, "clubs")],
+            [Card(12, "hearts")],
+            [Card(13, "spades")],
+        ],
+        stock=[Card(1, "clubs")] * 24,
+    )
+
+    class StubModel:
+        def score(self, batch):
+            return np.linspace(0.0, 1.0, len(batch), dtype=np.float32)
+
+    monkeypatch.setattr(training_module, "load_latest_model", lambda: None)
+    monkeypatch.setattr(training_module, "load_model_metadata", lambda: {})
+    monkeypatch.setattr(training_module, "load_hole_model", lambda: None)
+    monkeypatch.setattr(training_module, "load_hole_model_metadata", lambda: {})
+    monkeypatch.setattr(training_module, "load_compact_model", lambda: StubModel())
+    monkeypatch.setattr(training_module, "load_compact_model_metadata", lambda: {"ready": True})
+
+    ranking = rank_actions_for_state(state, limit=3)
+    assert ranking["compact_model_active"] is True
+    assert ranking["ranking_source"] == "search+compact"
+    assert any(suggestion.get("compact_model_score") is not None for suggestion in ranking["suggestions"])
 
 
 def test_load_human_feedback_cases_uses_strongest_duplicate(tmp_path):
