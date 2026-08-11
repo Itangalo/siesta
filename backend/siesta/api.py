@@ -27,6 +27,11 @@ from .game import (
     legal_moves,
     serialize_state,
 )
+from .deadlock import (
+    dead_card_positions,
+    is_provably_lost,
+)
+from .reachability import DEFAULT_MAX_DEPTH, cards_movable_within
 from .training import rank_actions_for_state, train_policy_model
 
 
@@ -173,8 +178,39 @@ if FRONTEND_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
 
+def _annotate_deadlock(snapshot: Dict[str, Any], state: GameState) -> Dict[str, Any]:
+    """Mark cards that can only ever move into a hole, and flag a locked deal.
+
+    Kings are dead by definition and carry no information, so they are reported
+    separately from the ranks that were *derived* dead - those are the ones that
+    say something about how the position is going.
+    """
+
+    dead = dead_card_positions(state)
+    per_column: Dict[int, List[int]] = {}
+    for column_index, card_index in dead:
+        per_column.setdefault(column_index, []).append(card_index)
+
+    for column_index, card_indices in per_column.items():
+        for card_index in card_indices:
+            is_king = state.columns[column_index][card_index].rank == 13
+            card = snapshot["columns"][column_index]["cards"][card_index]
+            card["dead"] = True
+            # Kings are dead by definition rather than derived, but they are
+            # marked too: it makes the marking verifiable by eye.
+            card["dead_by_rule"] = not is_king
+            card["dead_marked"] = True
+
+    snapshot["provably_lost"] = is_provably_lost(state)
+    snapshot["dead_card_count"] = len(dead)
+    return snapshot
+
+
 def _serialize_session(session: GameSession) -> Dict[str, Any]:
-    return serialize_state(session.state, game_id=session.game_id, history_depth=len(session.history) - 1)
+    return _annotate_deadlock(
+        serialize_state(session.state, game_id=session.game_id, history_depth=len(session.history) - 1),
+        session.state,
+    )
 
 
 def _serialize_game_state(state: GameState) -> Dict[str, Any]:
@@ -217,7 +253,7 @@ def _card_dict(card: Card) -> Dict[str, Any]:
 
 
 def _snapshot_with_stock(state: GameState, game_id: str, history_depth: int) -> Dict[str, Any]:
-    snapshot = serialize_state(state, game_id=game_id, history_depth=history_depth)
+    snapshot = _annotate_deadlock(serialize_state(state, game_id=game_id, history_depth=history_depth), state)
     snapshot["stock_cards"] = [_card_dict(card) for card in state.stock]
     return snapshot
 
@@ -364,6 +400,26 @@ def get_legal_moves(game_id: str) -> Dict[str, Any]:
         "game_id": game_id,
         "legal_moves": [move.to_dict(session.state) for move in legal_moves(session.state)],
         "can_deal": can_deal(session.state),
+    }
+
+
+@app.get("/game/reachable-moves")
+def get_reachable_moves(game_id: str, depth: int = DEFAULT_MAX_DEPTH) -> Dict[str, Any]:
+    """Cards movable within `depth` moves.
+
+    Deliberately its own endpoint rather than part of the snapshot: at depth 4
+    this costs up to ~340ms on a branchy position, which would land on every
+    move. Here it is only paid when the marking is switched on.
+    """
+
+    if depth < 1 or depth > 4:
+        raise HTTPException(status_code=400, detail="depth must be between 1 and 4.")
+    session = _get_session(game_id)
+    return {
+        "game_id": game_id,
+        "state_hash": session.state.state_hash,
+        "depth": depth,
+        "movable_within": cards_movable_within(session.state, max_depth=depth),
     }
 
 

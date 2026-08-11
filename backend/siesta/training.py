@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from .deadlock import is_provably_lost
 from .game import (
     Card,
     GameState,
@@ -76,7 +77,14 @@ DEFAULT_HOLE_GOAL_HORIZON = 5
 DEFAULT_HOLE_GOAL_BEAM_WIDTH = 6
 DEFAULT_COMPACT_GOAL_HORIZON = 5
 DEFAULT_COMPACT_GOAL_BEAM_WIDTH = 6
+DEFAULT_COMPACT_MIDGAME_MIN_STEPS = 6
+DEFAULT_COMPACT_MIDGAME_MAX_STEPS = 18
+DEFAULT_COMPACT_MIDGAME_SHARE = 0.4
+DEFAULT_TRAINING_STATE_SOURCE = "won_initial_states"
+VISIBLE_CARD_FEATURES_PER_CARD = 9
+MAX_CARD_DEPTH = 51.0
 ProgressCallback = Optional[Callable[[str], None]]
+CANONICAL_CARDS = tuple(create_deck())
 
 
 @dataclass(frozen=True)
@@ -122,6 +130,19 @@ class HumanFeedbackSummary:
     conceded_cases: int = 0
     unknown_outcome_cases: int = 0
     skipped_normal_conceded_cases: int = 0
+
+
+@dataclass(frozen=True)
+class TrainingStartState:
+    source_id: str
+    state: GameState
+    source_type: str
+
+
+@dataclass
+class RolloutTraceStep:
+    state: GameState
+    action: Action
 
 
 def emit_progress(progress: ProgressCallback, message: str) -> None:
@@ -237,6 +258,52 @@ def hole_setup_score(state: GameState) -> float:
     return score
 
 
+STOCK_DESTINATION_WEIGHT = 0.7
+"""How much an undealt rank+1 counts next to one already exposed on the table."""
+
+HOLE_TENANT_WEIGHT = 0.0
+"""Reward for parking a recoverable card in a hole, per unit of destination supply.
+
+Off by default: two A/B runs found no benefit, one of them confounded and the
+other unable to discriminate because the self-play policy never wins. The
+primitives above are correct and tested, so raise this once there is an
+evaluation that can actually measure a change.
+"""
+
+
+def stock_rank_counts(state: GameState) -> Dict[int, int]:
+    counts: Dict[int, int] = {}
+    for card in state.stock:
+        counts[card.rank] = counts.get(card.rank, 0) + 1
+    return counts
+
+
+def exposed_rank_counts(state: GameState) -> Dict[int, int]:
+    counts: Dict[int, int] = {}
+    for column in state.columns:
+        if column:
+            counts[column[-1].rank] = counts.get(column[-1].rank, 0) + 1
+    return counts
+
+
+def destination_supply(state: GameState, rank: int) -> float:
+    """How readily a card of ``rank`` will find a home on a rank+1 card later.
+
+    Used to judge what to park in a hole before dealing: a six is a good
+    tenant while sevens are still undealt, because each deal exposes its card
+    on top of a column and hands the six a destination, which wins the hole
+    back. A king scores zero - it can never leave, so it spends the hole for
+    good.
+    """
+
+    if rank >= 13:
+        return 0.0
+    target = rank + 1
+    exposed = exposed_rank_counts(state).get(target, 0)
+    in_stock = stock_rank_counts(state).get(target, 0)
+    return float(exposed) + STOCK_DESTINATION_WEIGHT * in_stock
+
+
 def mobility_score(state: GameState) -> float:
     actions = legal_moves(state)
     if not actions:
@@ -336,9 +403,19 @@ def hole_bonus(empty_columns: int) -> float:
     return bonus
 
 
+DEAD_STATE_PENALTY = 10000.0
+"""Applied to states from which no empty column can ever be created again.
+
+The penalty is subtracted rather than replacing the score, so that relative
+ordering survives when every available action leads into a locked position.
+"""
+
+
 def evaluate_action(state: GameState, action: Action) -> float:
     next_state = apply_action(state, action)
     score = 0.0
+    if is_provably_lost(next_state):
+        score -= DEAD_STATE_PENALTY
     before_empty = empty_column_count(state)
     after_empty = empty_column_count(next_state)
     before_hole_setup = hole_setup_score(state)
@@ -371,6 +448,10 @@ def evaluate_action(state: GameState, action: Action) -> float:
         destination = state.columns[action.move.to_column][-1] if state.columns[action.move.to_column] else None
         if destination and destination.suit == moved[0].suit:
             score += 4.0
+        if destination is None:
+            # Filling a hole: prefer a tenant we have a good chance of moving
+            # on later, which wins the hole back.
+            score += HOLE_TENANT_WEIGHT * destination_supply(state, moved[0].rank)
         if move_creates_hole(state, action):
             if before_empty == 0:
                 score += 46.0
@@ -406,6 +487,8 @@ def evaluate_state_snapshot(state: GameState) -> float:
     score -= 2.4 * blocked_mid_rank_risk(state)
     score -= 0.3 * top_color_mix_penalty(state)
     score -= 0.35 * len(state.stock)
+    if is_provably_lost(state):
+        score -= DEAD_STATE_PENALTY
     return score
 
 
@@ -886,6 +969,25 @@ def global_state_features(state: GameState) -> np.ndarray:
     return np.asarray(features, dtype=np.float32)
 
 
+def visible_tableau_card_features(state: GameState) -> np.ndarray:
+    features = np.zeros(len(CANONICAL_CARDS) * VISIBLE_CARD_FEATURES_PER_CARD, dtype=np.float32)
+    visible_positions: Dict[Card, Tuple[int, int]] = {}
+    for column_index, column in enumerate(state.columns):
+        for depth_from_bottom, card in enumerate(column):
+            visible_positions[card] = (column_index, depth_from_bottom)
+
+    for card_index, card in enumerate(CANONICAL_CARDS):
+        offset = card_index * VISIBLE_CARD_FEATURES_PER_CARD
+        position = visible_positions.get(card)
+        if position is None:
+            features[offset] = 1.0
+            continue
+        column_index, depth_from_bottom = position
+        features[offset + 1 + column_index] = 1.0
+        features[offset + 8] = depth_from_bottom / MAX_CARD_DEPTH
+    return features
+
+
 def action_features(state: GameState, action: Action) -> np.ndarray:
     features: List[float] = []
     type_flags = [1.0 if action.type == "move" else 0.0, 1.0 if action.type == "deal" else 0.0]
@@ -916,10 +1018,42 @@ def action_features(state: GameState, action: Action) -> np.ndarray:
 
 
 def encode_action(state: GameState, action: Action) -> np.ndarray:
-    return np.concatenate([global_state_features(state), action_features(state, action), action_outcome_features(state, action)])
+    return np.concatenate(
+        [
+            visible_tableau_card_features(state),
+            global_state_features(state),
+            action_features(state, action),
+            action_outcome_features(state, action),
+        ]
+    )
 
 
 def action_outcome_features(state: GameState, action: Action) -> np.ndarray:
+    if action.type == "deal":
+        cards_to_deal = min(7, len(state.stock))
+        before_empty = empty_column_count(state)
+        empties_filled = sum(1 for column_index in range(cards_to_deal) if not state.columns[column_index])
+        after_empty = max(0, before_empty - empties_filled)
+        features = [
+            state.completed_sequences / 4.0,
+            run_depth(state) / 13.0,
+            total_run_depth(state) / 52.0,
+            after_empty / 7.0,
+            hole_setup_score(state) / 20.0,
+            hole_access_score(state) / 24.0,
+            mobility_score(state) / 30.0,
+            (after_empty - before_empty) / 3.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0 if after_empty >= 2 else 0.0,
+            max(0, len(state.stock) - cards_to_deal) / 24.0,
+            progress_score(state) / 52.0,
+        ]
+        return np.asarray(features, dtype=np.float32)
+
     next_state = apply_action(state, action)
     before_empty = empty_column_count(state)
     after_empty = empty_column_count(next_state)
@@ -1094,6 +1228,8 @@ def build_training_examples(
     alternate_actions: int = DEFAULT_TEACHER_ALTERNATE_ACTIONS,
     max_states_per_game: int = DEFAULT_TEACHER_MAX_STATES_PER_GAME,
     branch_margin: float = DEFAULT_TEACHER_BRANCH_MARGIN,
+    state_source: str = "random_seed",
+    sessions_dir: Path = DEFAULT_SESSIONS_DIR,
     progress: ProgressCallback = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     cases = build_training_cases(
@@ -1110,6 +1246,8 @@ def build_training_examples(
         alternate_actions=alternate_actions,
         max_states_per_game=max_states_per_game,
         branch_margin=branch_margin,
+        state_source=state_source,
+        sessions_dir=sessions_dir,
         progress=progress,
     )
     examples: List[np.ndarray] = []
@@ -1136,6 +1274,94 @@ def training_game_seeds(num_games: int, seed_offset: int = 0) -> List[int]:
     return seeds
 
 
+def _deserialize_session_state(payload: Dict[str, Any]) -> GameState:
+    return GameState(
+        columns=[
+            [Card(rank=int(card["rank"]), suit=str(card["suit"])) for card in column]
+            for column in payload["columns"]
+        ],
+        stock=[Card(rank=int(card["rank"]), suit=str(card["suit"])) for card in payload["stock"]],
+        status=str(payload["status"]),
+        moves_played=int(payload["moves_played"]),
+        terminal_reason=payload.get("terminal_reason"),
+        state_hash=str(payload.get("state_hash", "")),
+        completed_sequences=int(payload.get("completed_sequences", 0)),
+    )
+
+
+def load_winning_initial_states(sessions_dir: Path = DEFAULT_SESSIONS_DIR) -> List[TrainingStartState]:
+    states: List[TrainingStartState] = []
+    if not sessions_dir.exists():
+        return states
+
+    for path in sorted(sessions_dir.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        history = payload.get("history") or []
+        if not history:
+            continue
+        last_state = history[-1]
+        if str(last_state.get("status", STATUS_IN_PROGRESS)) != STATUS_WON:
+            continue
+        try:
+            initial_state = _deserialize_session_state(history[0])
+        except (KeyError, TypeError, ValueError):
+            continue
+        states.append(
+            TrainingStartState(
+                source_id=str(payload.get("game_id", path.stem)),
+                state=initial_state,
+                source_type="won_initial_state",
+            )
+        )
+    return states
+
+
+def training_start_states(
+    num_games: int,
+    seed_offset: int = 0,
+    state_source: str = "random_seed",
+    sessions_dir: Path = DEFAULT_SESSIONS_DIR,
+    progress: ProgressCallback = None,
+) -> List[TrainingStartState]:
+    if state_source == "random_seed":
+        return [
+            TrainingStartState(source_id=str(seed), state=create_game(seed=seed), source_type="random_seed")
+            for seed in training_game_seeds(num_games=num_games, seed_offset=seed_offset)
+        ]
+    if state_source != "won_initial_states":
+        raise ValueError(f"Unsupported training state source: {state_source}")
+
+    pool = load_winning_initial_states(sessions_dir=sessions_dir)
+    if not pool:
+        raise RuntimeError(f"No winning initial states found in {sessions_dir}.")
+
+    rng = random.Random(17 + seed_offset)
+    ordered_pool = list(pool)
+    rng.shuffle(ordered_pool)
+    selected: List[TrainingStartState] = []
+    while len(selected) < num_games:
+        for item in ordered_pool:
+            selected.append(
+                TrainingStartState(
+                    source_id=item.source_id,
+                    state=item.state.clone(),
+                    source_type=item.source_type,
+                )
+            )
+            if len(selected) >= num_games:
+                break
+        if len(selected) < num_games:
+            rng.shuffle(ordered_pool)
+    emit_progress(
+        progress,
+        f"[data] loaded {len(pool)} winning initial states from {sessions_dir}, sampling {num_games}",
+    )
+    return selected
+
+
 def build_training_cases(
     num_games: int = 60,
     max_moves: int = 180,
@@ -1150,16 +1376,28 @@ def build_training_cases(
     alternate_actions: int = DEFAULT_TEACHER_ALTERNATE_ACTIONS,
     max_states_per_game: int = DEFAULT_TEACHER_MAX_STATES_PER_GAME,
     branch_margin: float = DEFAULT_TEACHER_BRANCH_MARGIN,
+    state_source: str = "random_seed",
+    sessions_dir: Path = DEFAULT_SESSIONS_DIR,
     progress: ProgressCallback = None,
 ) -> List[TrainingCase]:
     cases: List[TrainingCase] = []
     rng = random.Random(17 + seed_offset)
-    game_seeds = training_game_seeds(num_games=num_games, seed_offset=seed_offset)
+    start_states = training_start_states(
+        num_games=num_games,
+        seed_offset=seed_offset,
+        state_source=state_source,
+        sessions_dir=sessions_dir,
+        progress=progress,
+    )
     progress_every = max(1, num_games // 10)
-    emit_progress(progress, f"[data] generating training cases from {num_games} games using {teacher_policy}")
+    emit_progress(
+        progress,
+        f"[data] generating training cases from {num_games} games using {teacher_policy} "
+        f"(state_source={state_source})",
+    )
 
-    for game_index, game_seed in enumerate(game_seeds, start=1):
-        state_queue: List[GameState] = [create_game(seed=game_seed)]
+    for game_index, start in enumerate(start_states, start=1):
+        state_queue: List[GameState] = [start.state.clone()]
         queued_hashes = {state_queue[0].state_hash}
         explored_states = 0
 
@@ -1169,7 +1407,7 @@ def build_training_cases(
             emit_progress(
                 progress,
                 "[data] "
-                f"game={game_index}/{num_games} deal_seed={game_seed} "
+                f"game={game_index}/{num_games} start={start.source_type}:{start.source_id} "
                 f"exploring branch {explored_states}/{max_states_per_game} queue={len(state_queue)}",
             )
             repeated_states: Dict[str, int] = {}
@@ -1380,6 +1618,100 @@ def build_compact_opening_cases(
     return cases
 
 
+def _compact_midgame_state(
+    seed: int,
+    min_steps: int = DEFAULT_COMPACT_MIDGAME_MIN_STEPS,
+    max_steps: int = DEFAULT_COMPACT_MIDGAME_MAX_STEPS,
+) -> Optional[GameState]:
+    state = create_game(seed=seed)
+    rng = random.Random(seed + 7000)
+    target_steps = rng.randint(min_steps, max_steps)
+
+    for _ in range(target_steps):
+        if state.status != STATUS_IN_PROGRESS:
+            break
+        action = choose_search_action(
+            state,
+            depth=DEFAULT_UI_SEARCH_DEPTH,
+            beam_width=DEFAULT_UI_SEARCH_BEAM_WIDTH,
+            discount=DEFAULT_UI_SEARCH_DISCOUNT,
+            rollout_steps=DEFAULT_UI_SEARCH_ROLLOUT_STEPS,
+        )
+        if action is None:
+            break
+        state = apply_action(state, action)
+
+    if state.status != STATUS_IN_PROGRESS:
+        return None
+    if state.moves_played < min_steps:
+        return None
+    if not available_actions(state):
+        return None
+    return state
+
+
+def build_compact_midgame_cases(
+    num_games: int = 40,
+    seed_offset: int = 0,
+    horizon: int = DEFAULT_COMPACT_GOAL_HORIZON,
+    beam_width: int = DEFAULT_COMPACT_GOAL_BEAM_WIDTH,
+    min_steps: int = DEFAULT_COMPACT_MIDGAME_MIN_STEPS,
+    max_steps: int = DEFAULT_COMPACT_MIDGAME_MAX_STEPS,
+    progress: ProgressCallback = None,
+) -> List[TrainingCase]:
+    cases: List[TrainingCase] = []
+    game_seeds = training_game_seeds(num_games=num_games, seed_offset=seed_offset)
+    progress_every = max(1, num_games // 10)
+    emit_progress(progress, f"[compact-midgame] generating midgame cases from {num_games} games")
+
+    for game_index, game_seed in enumerate(game_seeds, start=1):
+        state = _compact_midgame_state(
+            game_seed,
+            min_steps=min_steps,
+            max_steps=max_steps,
+        )
+        if state is None:
+            continue
+        actions = available_actions(state)
+        if not actions:
+            continue
+        ranked_actions = rank_compact_search_actions(state, horizon=horizon, beam_width=beam_width)
+        if not ranked_actions:
+            continue
+        chosen = ranked_actions[0][1]
+        ranked_map = {action_signature(state, action): score for score, action in ranked_actions}
+        signatures = [action_signature(state, action) for action in actions]
+        chosen_signature = action_signature(state, chosen)
+        target_index = signatures.index(chosen_signature)
+        soft_targets = teacher_soft_targets(signatures, ranked_map)
+        best_outcome = best_compact_goal_outcome(apply_action(state, chosen), horizon=max(0, horizon - 1), beam_width=beam_width)
+        weight = 1.1
+        if best_outcome["reachable"]:
+            weight += 1.0
+        if best_outcome["best_empty_columns"] >= 2:
+            weight += 0.75
+        if best_outcome["min_effective_mass"] <= effective_column_mass(state) - 2:
+            weight += 0.65
+        cases.append(
+            TrainingCase(
+                features=np.vstack([encode_action(state, action) for action in actions]),
+                target_index=target_index,
+                weight=weight,
+                chosen_signature=chosen_signature,
+                action_signatures=signatures,
+                soft_targets=soft_targets,
+                target_boost=0.9,
+                source="compact_midgame",
+            )
+        )
+        if game_index % progress_every == 0 or game_index == num_games:
+            emit_progress(progress, f"[compact-midgame] processed {game_index}/{num_games} games, cases={len(cases)}")
+
+    if not cases:
+        raise RuntimeError("No compact-midgame examples were generated.")
+    return cases
+
+
 def train_policy_model(
     num_games: int = 60,
     epochs: int = 30,
@@ -1387,10 +1719,24 @@ def train_policy_model(
     hidden_dim: int = 64,
     teacher_policy: str = "search",
     benchmark_games: int = 20,
+    training_state_source: str = DEFAULT_TRAINING_STATE_SOURCE,
+    sessions_dir: Path = DEFAULT_SESSIONS_DIR,
     progress: ProgressCallback = None,
 ) -> Dict[str, Any]:
-    generated_cases = build_training_cases(num_games=num_games, teacher_policy=teacher_policy, progress=progress)
-    human_cases, human_feedback_summary = load_human_feedback_cases(progress=progress)
+    generated_cases = build_training_cases(
+        num_games=num_games,
+        teacher_policy=teacher_policy,
+        state_source=training_state_source,
+        sessions_dir=sessions_dir,
+        progress=progress,
+    )
+    include_human_feedback = training_state_source != "won_initial_states"
+    if include_human_feedback:
+        human_cases, human_feedback_summary = load_human_feedback_cases(progress=progress)
+    else:
+        human_cases = []
+        human_feedback_summary = HumanFeedbackSummary()
+        emit_progress(progress, "[feedback] disabled for won_initial_states training")
     cases, human_repeat_factor = expand_human_cases_for_training(generated_cases, human_cases, progress=progress)
     benchmark_seeds = list(range(benchmark_games))
     active_model_before = load_latest_model()
@@ -1437,6 +1783,8 @@ def train_policy_model(
         "learning_rate": learning_rate,
         "hidden_dim": hidden_dim,
         "teacher_policy": teacher_policy,
+        "training_state_source": training_state_source,
+        "human_feedback_enabled": include_human_feedback,
         "benchmark_games": benchmark_games,
         "training_cases": len(cases),
         "generated_training_cases": len(generated_cases),
@@ -1456,6 +1804,342 @@ def train_policy_model(
         "teacher_alternate_actions": DEFAULT_TEACHER_ALTERNATE_ACTIONS,
         "teacher_max_states_per_game": DEFAULT_TEACHER_MAX_STATES_PER_GAME,
         "metrics": metrics,
+        "heuristic_evaluation": heuristic_eval,
+        "search_evaluation": search_eval,
+        "candidate_model_evaluation": candidate_eval,
+        "active_model_before_evaluation": active_eval_before,
+        "active_model_evaluation": active_eval,
+        "model_evaluation": active_eval,
+        "promoted_to_active": promoted_to_active,
+        "active_model_path": str(DEFAULT_MODEL_PATH),
+        "eligible_for_ui": eligible_for_ui,
+    }
+    save_candidate_checkpoint(model, candidate_metadata)
+    if promoted_to_active:
+        active_metadata = dict(candidate_metadata)
+        active_metadata["eligible_for_ui"] = eligible_for_ui
+        active_metadata["promoted_to_active"] = True
+        active_metadata["previous_active_metadata"] = active_metadata_before if active_metadata_before else None
+        promote_candidate_checkpoint(active_metadata)
+    return {
+        "model_path": str(DEFAULT_MODEL_PATH),
+        "candidate_model_path": str(DEFAULT_CANDIDATE_MODEL_PATH),
+        **candidate_metadata,
+    }
+
+
+def improve_policy_from_winning_rollouts(
+    num_games: int = 20,
+    rollouts_per_game: int = 32,
+    epochs: int = 20,
+    learning_rate: float = 0.02,
+    hidden_dim: int = 256,
+    benchmark_games: int = 20,
+    temperature: float = 1.0,
+    top_k: int = 3,
+    epsilon_random: float = 0.08,
+    max_moves: int = 180,
+    stagnation_limit: int = 30,
+    repeat_limit: int = 3,
+    sessions_dir: Path = DEFAULT_SESSIONS_DIR,
+    progress: ProgressCallback = None,
+) -> Dict[str, Any]:
+    start_states = training_start_states(
+        num_games=num_games,
+        state_source="won_initial_states",
+        sessions_dir=sessions_dir,
+        progress=progress,
+    )
+    active_model_before = load_latest_model()
+    active_metadata_before = load_model_metadata()
+    if active_model_before is not None and active_model_before.hidden_dim == hidden_dim:
+        model = clone_policy_model(active_model_before)
+        initialization = "active_checkpoint"
+    else:
+        model = NumpyPolicyNetwork(input_dim=current_input_dim(), hidden_dim=hidden_dim)
+        initialization = "fresh"
+        if active_model_before is not None and active_model_before.hidden_dim != hidden_dim:
+            emit_progress(
+                progress,
+                f"[self-win] active model hidden_dim={active_model_before.hidden_dim} incompatible with requested hidden_dim={hidden_dim}; starting fresh",
+            )
+
+    report_every = max(1, len(start_states) // 5)
+    successful_episodes: List[Dict[str, Any]] = []
+    rollout_stats: List[Dict[str, Any]] = []
+    total_rollouts = 0
+
+    for game_index, start in enumerate(start_states, start=1):
+        seed_successes = 0
+        seed_best_progress = 0.0
+        for attempt in range(rollouts_per_game):
+            total_rollouts += 1
+            rng = random.Random(1000 * game_index + attempt)
+            episode = play_self_win_rollout(
+                start.state,
+                model=model,
+                rng=rng,
+                max_moves=max_moves,
+                stagnation_limit=stagnation_limit,
+                repeat_limit=repeat_limit,
+                temperature=temperature,
+                top_k=top_k,
+                epsilon_random=epsilon_random,
+            )
+            seed_best_progress = max(seed_best_progress, float(episode["progress_score"]))
+            if episode["status"] == STATUS_WON:
+                successful_episodes.append(episode)
+                seed_successes += 1
+        rollout_stats.append(
+            {
+                "source_id": start.source_id,
+                "rollouts": rollouts_per_game,
+                "wins": seed_successes,
+                "best_progress": seed_best_progress,
+            }
+        )
+        if game_index % report_every == 0 or game_index == len(start_states):
+            emit_progress(
+                progress,
+                f"[self-win] processed {game_index}/{len(start_states)} start states "
+                f"rollouts={total_rollouts} wins={len(successful_episodes)}",
+            )
+
+    cases = build_cases_from_winning_rollouts(successful_episodes)
+    emit_progress(
+        progress,
+        f"[self-win] collected {len(successful_episodes)} winning rollouts and {len(cases)} unique training cases",
+    )
+
+    metrics = None
+    if cases:
+        emit_progress(progress, f"[self-win] training on {len(cases)} self-win cases")
+        metrics = model.train_ranked(cases, epochs=epochs, learning_rate=learning_rate, progress=progress)
+
+    benchmark_seeds = list(range(benchmark_games))
+    emit_progress(progress, "[benchmark] evaluating heuristic")
+    heuristic_eval = summarize_evaluation(
+        evaluate_policy(policy="heuristic", seeds=benchmark_seeds, progress=progress)
+    )
+    emit_progress(progress, "[benchmark] evaluating search")
+    search_eval = summarize_evaluation(
+        evaluate_policy(policy="search", seeds=benchmark_seeds, progress=progress)
+    )
+    emit_progress(progress, "[benchmark] evaluating candidate model")
+    candidate_eval = summarize_evaluation(
+        evaluate_policy(policy="model", seeds=benchmark_seeds, model=model, progress=progress)
+    )
+    active_eval_before = None
+    if active_model_before is not None:
+        emit_progress(progress, "[benchmark] evaluating active model")
+        active_eval_before = summarize_evaluation(
+            evaluate_policy(policy="model", seeds=benchmark_seeds, model=active_model_before, progress=progress)
+        )
+
+    promoted_to_active = bool(cases) and model_is_better(candidate_eval, active_eval_before)
+    active_eval = candidate_eval if promoted_to_active or active_eval_before is None else active_eval_before
+    eligible_for_ui = (
+        active_eval["win_rate"] > heuristic_eval["win_rate"]
+        or (
+            active_eval["win_rate"] == heuristic_eval["win_rate"]
+            and active_eval["average_progress"] >= heuristic_eval["average_progress"]
+        )
+    )
+    candidate_metadata = {
+        "training_mode": "self_win_rollouts",
+        "num_games": num_games,
+        "rollouts_per_game": rollouts_per_game,
+        "epochs": epochs,
+        "learning_rate": learning_rate,
+        "hidden_dim": hidden_dim,
+        "training_state_source": "won_initial_states",
+        "human_feedback_enabled": False,
+        "benchmark_games": benchmark_games,
+        "temperature": temperature,
+        "top_k": top_k,
+        "epsilon_random": epsilon_random,
+        "max_moves": max_moves,
+        "stagnation_limit": stagnation_limit,
+        "repeat_limit": repeat_limit,
+        "model_initialization": initialization,
+        "winning_rollouts": len(successful_episodes),
+        "rollout_success_rate": (len(successful_episodes) / total_rollouts) if total_rollouts else 0.0,
+        "winning_start_states": sum(1 for stat in rollout_stats if stat["wins"] > 0),
+        "training_cases": len(cases),
+        "generated_training_cases": len(cases),
+        "human_feedback_cases": 0,
+        "effective_human_training_cases": 0,
+        "human_repeat_factor": 1,
+        "human_feedback_records_seen": 0,
+        "human_feedback_unique_entries": 0,
+        "human_feedback_inferred_stock_cases": 0,
+        "human_feedback_won_cases": 0,
+        "human_feedback_conceded_cases": 0,
+        "human_feedback_unknown_outcome_cases": 0,
+        "human_feedback_skipped_normal_conceded_cases": 0,
+        "metrics": metrics,
+        "rollout_stats": rollout_stats,
+        "heuristic_evaluation": heuristic_eval,
+        "search_evaluation": search_eval,
+        "candidate_model_evaluation": candidate_eval,
+        "active_model_before_evaluation": active_eval_before,
+        "active_model_evaluation": active_eval,
+        "model_evaluation": active_eval,
+        "promoted_to_active": promoted_to_active,
+        "active_model_path": str(DEFAULT_MODEL_PATH),
+        "eligible_for_ui": eligible_for_ui,
+    }
+    save_candidate_checkpoint(model, candidate_metadata)
+    if promoted_to_active:
+        active_metadata = dict(candidate_metadata)
+        active_metadata["eligible_for_ui"] = eligible_for_ui
+        active_metadata["promoted_to_active"] = True
+        active_metadata["previous_active_metadata"] = active_metadata_before if active_metadata_before else None
+        promote_candidate_checkpoint(active_metadata)
+    return {
+        "model_path": str(DEFAULT_MODEL_PATH),
+        "candidate_model_path": str(DEFAULT_CANDIDATE_MODEL_PATH),
+        **candidate_metadata,
+    }
+
+
+def improve_policy_from_beam_search_wins(
+    num_games: int = 19,
+    epochs: int = 10,
+    learning_rate: float = 0.02,
+    hidden_dim: int = 256,
+    benchmark_games: int = 20,
+    beam_width: int = 48,
+    branching_factor: int = 6,
+    max_nodes_per_game: int = 4000,
+    max_moves: int = 180,
+    max_wins_per_game: int = 1,
+    sessions_dir: Path = DEFAULT_SESSIONS_DIR,
+    progress: ProgressCallback = None,
+) -> Dict[str, Any]:
+    start_states = training_start_states(
+        num_games=num_games,
+        state_source="won_initial_states",
+        sessions_dir=sessions_dir,
+        progress=progress,
+    )
+    active_model_before = load_latest_model()
+    active_metadata_before = load_model_metadata()
+    if active_model_before is not None and active_model_before.hidden_dim == hidden_dim:
+        model = clone_policy_model(active_model_before)
+        initialization = "active_checkpoint"
+    else:
+        model = NumpyPolicyNetwork(input_dim=current_input_dim(), hidden_dim=hidden_dim)
+        initialization = "fresh"
+        if active_model_before is not None and active_model_before.hidden_dim != hidden_dim:
+            emit_progress(
+                progress,
+                f"[beam-win] active model hidden_dim={active_model_before.hidden_dim} incompatible with requested hidden_dim={hidden_dim}; starting fresh",
+            )
+
+    report_every = max(1, len(start_states) // 5)
+    successful_episodes: List[Dict[str, Any]] = []
+    search_stats: List[Dict[str, Any]] = []
+    total_expanded_nodes = 0
+
+    for game_index, start in enumerate(start_states, start=1):
+        result = search_winning_episodes_from_state(
+            start.state,
+            model=model,
+            beam_width=beam_width,
+            branching_factor=branching_factor,
+            max_nodes=max_nodes_per_game,
+            max_moves=max_moves,
+            max_wins=max_wins_per_game,
+        )
+        successful_episodes.extend(result["winning_episodes"])
+        total_expanded_nodes += int(result["expanded_nodes"])
+        search_stats.append(
+            {
+                "source_id": start.source_id,
+                "wins": len(result["winning_episodes"]),
+                "expanded_nodes": result["expanded_nodes"],
+                "best_progress": result["best_progress"],
+            }
+        )
+        if game_index % report_every == 0 or game_index == len(start_states):
+            emit_progress(
+                progress,
+                f"[beam-win] processed {game_index}/{len(start_states)} start states "
+                f"expanded_nodes={total_expanded_nodes} wins={len(successful_episodes)}",
+            )
+
+    cases = build_cases_from_winning_rollouts(successful_episodes)
+    emit_progress(
+        progress,
+        f"[beam-win] collected {len(successful_episodes)} winning episodes and {len(cases)} unique training cases",
+    )
+
+    metrics = None
+    if cases:
+        emit_progress(progress, f"[beam-win] training on {len(cases)} beam-win cases")
+        metrics = model.train_ranked(cases, epochs=epochs, learning_rate=learning_rate, progress=progress)
+
+    benchmark_seeds = list(range(benchmark_games))
+    emit_progress(progress, "[benchmark] evaluating heuristic")
+    heuristic_eval = summarize_evaluation(
+        evaluate_policy(policy="heuristic", seeds=benchmark_seeds, progress=progress)
+    )
+    emit_progress(progress, "[benchmark] evaluating search")
+    search_eval = summarize_evaluation(
+        evaluate_policy(policy="search", seeds=benchmark_seeds, progress=progress)
+    )
+    emit_progress(progress, "[benchmark] evaluating candidate model")
+    candidate_eval = summarize_evaluation(
+        evaluate_policy(policy="model", seeds=benchmark_seeds, model=model, progress=progress)
+    )
+    active_eval_before = None
+    if active_model_before is not None:
+        emit_progress(progress, "[benchmark] evaluating active model")
+        active_eval_before = summarize_evaluation(
+            evaluate_policy(policy="model", seeds=benchmark_seeds, model=active_model_before, progress=progress)
+        )
+
+    promoted_to_active = bool(cases) and model_is_better(candidate_eval, active_eval_before)
+    active_eval = candidate_eval if promoted_to_active or active_eval_before is None else active_eval_before
+    eligible_for_ui = (
+        active_eval["win_rate"] > heuristic_eval["win_rate"]
+        or (
+            active_eval["win_rate"] == heuristic_eval["win_rate"]
+            and active_eval["average_progress"] >= heuristic_eval["average_progress"]
+        )
+    )
+    candidate_metadata = {
+        "training_mode": "beam_search_wins",
+        "num_games": num_games,
+        "epochs": epochs,
+        "learning_rate": learning_rate,
+        "hidden_dim": hidden_dim,
+        "training_state_source": "won_initial_states",
+        "human_feedback_enabled": False,
+        "benchmark_games": benchmark_games,
+        "beam_width": beam_width,
+        "branching_factor": branching_factor,
+        "max_nodes_per_game": max_nodes_per_game,
+        "max_moves": max_moves,
+        "max_wins_per_game": max_wins_per_game,
+        "model_initialization": initialization,
+        "winning_episodes": len(successful_episodes),
+        "winning_start_states": sum(1 for stat in search_stats if stat["wins"] > 0),
+        "training_cases": len(cases),
+        "generated_training_cases": len(cases),
+        "human_feedback_cases": 0,
+        "effective_human_training_cases": 0,
+        "human_repeat_factor": 1,
+        "human_feedback_records_seen": 0,
+        "human_feedback_unique_entries": 0,
+        "human_feedback_inferred_stock_cases": 0,
+        "human_feedback_won_cases": 0,
+        "human_feedback_conceded_cases": 0,
+        "human_feedback_unknown_outcome_cases": 0,
+        "human_feedback_skipped_normal_conceded_cases": 0,
+        "metrics": metrics,
+        "search_stats": search_stats,
         "heuristic_evaluation": heuristic_eval,
         "search_evaluation": search_eval,
         "candidate_model_evaluation": candidate_eval,
@@ -1612,18 +2296,35 @@ def train_compact_opening_model(
     benchmark_games: int = 50,
     horizon: int = DEFAULT_COMPACT_GOAL_HORIZON,
     beam_width: int = DEFAULT_COMPACT_GOAL_BEAM_WIDTH,
+    midgame_share: float = DEFAULT_COMPACT_MIDGAME_SHARE,
     progress: ProgressCallback = None,
 ) -> Dict[str, Any]:
-    cases = build_compact_opening_cases(
-        num_games=num_games,
+    midgame_games = max(0, min(num_games, int(round(num_games * midgame_share))))
+    opening_games = max(1, num_games - midgame_games)
+    opening_cases = build_compact_opening_cases(
+        num_games=opening_games,
         horizon=horizon,
         beam_width=beam_width,
         progress=progress,
     )
+    midgame_cases: List[TrainingCase] = []
+    if midgame_games > 0:
+        midgame_cases = build_compact_midgame_cases(
+            num_games=midgame_games,
+            seed_offset=opening_games,
+            horizon=horizon,
+            beam_width=beam_width,
+            progress=progress,
+        )
+    cases = opening_cases + midgame_cases
     benchmark_seeds = list(range(benchmark_games))
     active_model_before = load_compact_model()
     model = NumpyPolicyNetwork(input_dim=cases[0].features.shape[1], hidden_dim=hidden_dim)
-    emit_progress(progress, f"[compact-train] training on {len(cases)} opening states")
+    emit_progress(
+        progress,
+        f"[compact-train] training on {len(cases)} states "
+        f"({len(opening_cases)} opening, {len(midgame_cases)} midgame)",
+    )
     metrics = model.train_ranked(cases, epochs=epochs, learning_rate=learning_rate, progress=progress)
 
     heuristic_eval = benchmark_compact_goal(
@@ -1670,6 +2371,9 @@ def train_compact_opening_model(
         "horizon": horizon,
         "beam_width": beam_width,
         "training_cases": len(cases),
+        "opening_training_cases": len(opening_cases),
+        "midgame_training_cases": len(midgame_cases),
+        "midgame_share": midgame_share,
         "metrics": metrics,
         "heuristic_compact_evaluation": heuristic_eval,
         "search_compact_evaluation": search_eval["search"],
@@ -1744,6 +2448,263 @@ def choose_model_action(state: GameState, model: NumpyPolicyNetwork) -> Optional
     scores = model.score(features)
     best_index = int(np.argmax(scores))
     return actions[best_index]
+
+
+def sample_model_action(
+    state: GameState,
+    model: NumpyPolicyNetwork,
+    rng: random.Random,
+    temperature: float = 1.0,
+    top_k: int = 0,
+    epsilon_random: float = 0.0,
+) -> Optional[Action]:
+    actions = available_actions(state)
+    if not actions:
+        return None
+    if epsilon_random > 0.0 and rng.random() < epsilon_random:
+        return rng.choice(actions)
+
+    features = np.vstack([encode_action(state, action) for action in actions])
+    scores = model.score(features)
+    candidate_indices = np.arange(len(actions))
+    if 0 < top_k < len(actions):
+        candidate_indices = np.argsort(scores)[-top_k:]
+    candidate_scores = scores[candidate_indices]
+    probs = _softmax_probabilities(candidate_scores, temperature=temperature)
+    sampled_offset = rng.choices(range(len(candidate_indices)), weights=probs.tolist(), k=1)[0]
+    return actions[int(candidate_indices[sampled_offset])]
+
+
+def play_self_win_rollout(
+    initial_state: GameState,
+    model: NumpyPolicyNetwork,
+    rng: random.Random,
+    max_moves: int = 180,
+    stagnation_limit: int = 30,
+    repeat_limit: int = 3,
+    temperature: float = 1.0,
+    top_k: int = 0,
+    epsilon_random: float = 0.0,
+) -> Dict[str, Any]:
+    state = initial_state.clone()
+    repeated_states: Dict[str, int] = {}
+    best_progress = progress_score(state)
+    moves_since_progress = 0
+    trace: List[RolloutTraceStep] = []
+
+    for _ in range(max_moves):
+        if state.status != STATUS_IN_PROGRESS:
+            break
+        action = sample_model_action(
+            state,
+            model=model,
+            rng=rng,
+            temperature=temperature,
+            top_k=top_k,
+            epsilon_random=epsilon_random,
+        )
+        if action is None:
+            state = terminate_for_training(state, "no_actions")
+            break
+        trace.append(RolloutTraceStep(state=state.clone(), action=action))
+        state = apply_action(state, action)
+        if state.status != STATUS_IN_PROGRESS:
+            break
+
+        current_progress = progress_score(state)
+        if current_progress > best_progress:
+            best_progress = current_progress
+            moves_since_progress = 0
+        else:
+            moves_since_progress += 1
+
+        repeated_states[state.state_hash] = repeated_states.get(state.state_hash, 0) + 1
+        if repeated_states[state.state_hash] >= repeat_limit:
+            state = terminate_for_training(state, "loop")
+            break
+        if moves_since_progress >= stagnation_limit:
+            state = terminate_for_training(state, "stagnation")
+            break
+
+    return {
+        "status": state.status,
+        "terminal_reason": state.terminal_reason,
+        "moves_played": state.moves_played,
+        "progress_score": progress_score(state),
+        "completed_sequences": state.completed_sequences,
+        "trace": trace,
+        "final_state": state,
+    }
+
+
+def build_cases_from_winning_rollouts(episodes: Sequence[Dict[str, Any]]) -> List[TrainingCase]:
+    deduped: Dict[Tuple[str, str], TrainingCase] = {}
+    for episode in episodes:
+        for step in episode.get("trace", []):
+            actions = available_actions(step.state)
+            if not actions:
+                continue
+            signatures = [action_signature(step.state, action) for action in actions]
+            chosen_signature = action_signature(step.state, step.action)
+            if chosen_signature not in signatures:
+                continue
+            target_index = signatures.index(chosen_signature)
+            key = (step.state.state_hash, chosen_signature)
+            if key in deduped:
+                deduped[key].weight += 1.0
+                continue
+            soft_targets = np.zeros(len(actions), dtype=np.float32)
+            soft_targets[target_index] = 1.0
+            deduped[key] = TrainingCase(
+                features=np.vstack([encode_action(step.state, action) for action in actions]),
+                target_index=target_index,
+                weight=1.0,
+                chosen_signature=chosen_signature,
+                action_signatures=signatures,
+                soft_targets=soft_targets,
+                target_boost=1.0,
+                source="self_win",
+            )
+    return list(deduped.values())
+
+
+def clone_policy_model(model: NumpyPolicyNetwork) -> NumpyPolicyNetwork:
+    cloned = NumpyPolicyNetwork(input_dim=model.input_dim, hidden_dim=model.hidden_dim)
+    cloned.w1 = model.w1.copy()
+    cloned.b1 = model.b1.copy()
+    cloned.w2 = model.w2.copy()
+    cloned.b2 = model.b2.copy()
+    return cloned
+
+
+def rank_actions_for_win_search(
+    state: GameState,
+    model: NumpyPolicyNetwork,
+    model_weight: float = 0.4,
+) -> List[Tuple[float, Action]]:
+    actions = available_actions(state)
+    if not actions:
+        return []
+    features = np.vstack([encode_action(state, action) for action in actions])
+    model_scores = model.score(features)
+    model_ranked = sorted(
+        ((float(score), action) for score, action in zip(model_scores, actions)),
+        key=lambda item: item[0],
+        reverse=True,
+    )
+    heuristic_ranked = sorted(
+        ((evaluate_action(state, action), action) for action in actions),
+        key=lambda item: item[0],
+        reverse=True,
+    )
+    model_rank_weights = _rank_weight_map(model_ranked, state)
+    heuristic_rank_weights = _rank_weight_map(heuristic_ranked, state)
+    heuristic_weight = max(0.0, 1.0 - model_weight)
+    combined: List[Tuple[float, Action]] = []
+    for action in actions:
+        signature = action_signature(state, action)
+        combined_score = (
+            model_weight * model_rank_weights.get(signature, 0.0)
+            + heuristic_weight * heuristic_rank_weights.get(signature, 0.0)
+        )
+        combined.append((combined_score, action))
+    combined.sort(key=lambda item: item[0], reverse=True)
+    return combined
+
+
+def search_winning_episodes_from_state(
+    initial_state: GameState,
+    model: NumpyPolicyNetwork,
+    beam_width: int = 48,
+    branching_factor: int = 6,
+    max_nodes: int = 4000,
+    max_moves: int = 180,
+    max_wins: int = 1,
+) -> Dict[str, Any]:
+    frontier: List[Dict[str, Any]] = [{"state": initial_state.clone(), "trace": [], "score": 0.0}]
+    winning_episodes: List[Dict[str, Any]] = []
+    expanded_nodes = 0
+    best_progress = progress_score(initial_state)
+    best_seen_score = {initial_state.state_hash: 0.0}
+
+    for _ in range(max_moves):
+        if not frontier or expanded_nodes >= max_nodes or len(winning_episodes) >= max_wins:
+            break
+        expanded: List[Dict[str, Any]] = []
+        for node in frontier:
+            state = node["state"]
+            if state.status == STATUS_WON:
+                winning_episodes.append(
+                    {
+                        "status": state.status,
+                        "terminal_reason": state.terminal_reason,
+                        "moves_played": state.moves_played,
+                        "progress_score": progress_score(state),
+                        "completed_sequences": state.completed_sequences,
+                        "trace": node["trace"],
+                        "final_state": state,
+                    }
+                )
+                if len(winning_episodes) >= max_wins:
+                    break
+                continue
+            if state.status != STATUS_IN_PROGRESS:
+                continue
+            ranked_actions = rank_actions_for_win_search(state, model=model)
+            for combined_score, action in ranked_actions[:branching_factor]:
+                if expanded_nodes >= max_nodes:
+                    break
+                next_state = apply_action(state, action)
+                trace = list(node["trace"]) + [RolloutTraceStep(state=state.clone(), action=action)]
+                best_progress = max(best_progress, progress_score(next_state))
+                node_score = node["score"] + combined_score + 0.015 * evaluate_state_snapshot(next_state)
+                expanded_nodes += 1
+                if next_state.status == STATUS_WON:
+                    winning_episodes.append(
+                        {
+                            "status": next_state.status,
+                            "terminal_reason": next_state.terminal_reason,
+                            "moves_played": next_state.moves_played,
+                            "progress_score": progress_score(next_state),
+                            "completed_sequences": next_state.completed_sequences,
+                            "trace": trace,
+                            "final_state": next_state,
+                        }
+                    )
+                    if len(winning_episodes) >= max_wins:
+                        break
+                    continue
+                previous_best = best_seen_score.get(next_state.state_hash)
+                if previous_best is not None and previous_best >= node_score:
+                    continue
+                best_seen_score[next_state.state_hash] = node_score
+                expanded.append({"state": next_state, "trace": trace, "score": node_score})
+            if expanded_nodes >= max_nodes or len(winning_episodes) >= max_wins:
+                break
+
+        if len(winning_episodes) >= max_wins or expanded_nodes >= max_nodes:
+            break
+        if not expanded:
+            frontier = []
+            break
+
+        next_frontier: List[Dict[str, Any]] = []
+        seen_hashes = set()
+        for node in sorted(expanded, key=lambda item: item["score"], reverse=True):
+            state_hash = node["state"].state_hash
+            if state_hash in seen_hashes:
+                continue
+            next_frontier.append(node)
+            seen_hashes.add(state_hash)
+            if len(next_frontier) >= beam_width:
+                break
+        frontier = next_frontier
+
+    return {
+        "winning_episodes": winning_episodes,
+        "expanded_nodes": expanded_nodes,
+        "best_progress": best_progress,
+    }
 
 
 def play_hole_goal_episode(
@@ -2394,6 +3355,16 @@ def rank_actions_for_state(state: GameState, limit: int = 5) -> Dict[str, Any]:
             reverse=True,
         )
 
+    # The model heads score actions without any notion of a locked position, so
+    # they can promote a move that seals the deal. Demote those last of all.
+    dead_signatures = {
+        action_signature(state, action)
+        for _, action in base_ranked
+        if is_provably_lost(apply_action(state, action))
+    }
+    if dead_signatures:
+        base_ranked.sort(key=lambda item: action_signature(state, item[1]) in dead_signatures)
+
     ranked: List[Dict[str, Any]] = []
     for heuristic_score, action in base_ranked[:limit]:
         action_dict = action.to_dict(state)
@@ -2405,6 +3376,7 @@ def rank_actions_for_state(state: GameState, limit: int = 5) -> Dict[str, Any]:
                 "model_score": model_scores.get(action_dict["description"]),
                 "hole_model_score": hole_model_scores.get(action_dict["description"]),
                 "compact_model_score": compact_model_scores.get(action_dict["description"]),
+                "locks_position": action_signature(state, action) in dead_signatures,
             }
         )
     ranking_source = "model" if model_eligible else "search"
@@ -2434,6 +3406,13 @@ def teacher_soft_targets(
     exp_scores = np.exp(np.clip(shifted, -30.0, 30.0))
     probs = exp_scores / np.sum(exp_scores)
     return probs.astype(np.float32)
+
+
+def _softmax_probabilities(raw_scores: np.ndarray, temperature: float = 1.0) -> np.ndarray:
+    adjusted_temperature = max(1e-3, temperature)
+    shifted = (raw_scores - np.max(raw_scores)) / adjusted_temperature
+    exp_scores = np.exp(np.clip(shifted, -30.0, 30.0))
+    return exp_scores / np.sum(exp_scores)
 
 
 def _make_card(card_data: Dict[str, Any]) -> Card:

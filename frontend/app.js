@@ -43,6 +43,10 @@ const FEEDBACK_LABELS = {
 
 const ACTIVE_GAME_STORAGE_KEY = "siesta.activeGameId";
 const CAPTURE_STRENGTH_STORAGE_KEY = "siesta.captureStrength";
+const MARK_DEAD_STORAGE_KEY = "siesta.markDead";
+const MARK_MOVABLE_STORAGE_KEY = "siesta.markMovable";
+const MARK_REACHABLE_STORAGE_KEY = "siesta.markReachable";
+const REACHABLE_DEPTH = 4;
 const AI_REQUEST_TIMEOUT_MS = 3500;
 
 const state = {
@@ -62,7 +66,97 @@ const state = {
   aiAbortController: null,
   lastFeedbackStrength: null,
   captureStrength: "normal",
+  markDead: false,
+  markMovable: false,
+  markReachable: false,
+  reachable: null,
+  reachableStateHash: null,
 };
+
+/**
+ * Fetch the multi-step reachability marking for the current position.
+ *
+ * Kept off the snapshot on purpose: at depth 4 this costs up to ~340ms on a
+ * branchy position, which would be paid on every move. The result is tagged
+ * with the state hash it was computed for, so a late reply for a position we
+ * have already left is discarded rather than drawn.
+ */
+async function refreshReachable() {
+  if (!state.markReachable || !state.gameId || !state.snapshot) {
+    state.reachable = null;
+    state.reachableStateHash = null;
+    return;
+  }
+  const requestedHash = state.snapshot.state_hash;
+  try {
+    const result = await api(
+      `/game/reachable-moves?game_id=${encodeURIComponent(state.gameId)}&depth=${REACHABLE_DEPTH}`
+    );
+    if (!state.snapshot || state.snapshot.state_hash !== requestedHash) {
+      return;
+    }
+    state.reachable = result.movable_within;
+    state.reachableStateHash = result.state_hash;
+    setReachableError(null);
+    renderBoard();
+  } catch (error) {
+    state.reachable = null;
+    state.reachableStateHash = null;
+    // A silent failure is indistinguishable from "nothing is reachable", which
+    // is the worst possible way for this to break.
+    setReachableError(error);
+    renderBoard();
+  }
+}
+
+function setReachableError(error) {
+  const label = document.getElementById("mark-reachable").closest(".toggle");
+  if (!error) {
+    label.classList.remove("failed");
+    label.removeAttribute("title");
+    return;
+  }
+  label.classList.add("failed");
+  label.title = "Kunde inte hämta flerstegsmarkeringen. Är servern omstartad efter senaste ändringen?";
+  console.warn("[siesta] reachable-moves failed:", error);
+}
+
+function readStoredFlag(key) {
+  try {
+    return window.localStorage.getItem(key) === "true";
+  } catch (_) {
+    return false;
+  }
+}
+
+function storeFlag(key, value) {
+  try {
+    window.localStorage.setItem(key, value ? "true" : "false");
+  } catch (_) {
+    // Ignore storage errors; the game still works without persistence.
+  }
+}
+
+/**
+ * Cards that have an actual legal destination right now, as "column:index".
+ *
+ * Deliberately not the same as isMovableCard(), which only says a card sits on
+ * top of a colour run and can be picked up. Roughly four in ten pickable cards
+ * have nowhere to go.
+ */
+function movableCardKeys(snapshot) {
+  const keys = new Set();
+  (snapshot.legal_moves || []).forEach((move) => {
+    if (move.type !== "move") {
+      return;
+    }
+    const height = snapshot.columns[move.from_column].cards.length;
+    for (let index = height - move.run_length; index < height; index += 1) {
+      keys.add(`${move.from_column}:${index}`);
+    }
+  });
+  return keys;
+}
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -353,9 +447,20 @@ function setCaptureStrength(strength) {
   updateCaptureButtons();
 }
 
+function updateLostBanner() {
+  const banner = document.getElementById("lost-banner");
+  const locked = state.snapshot && state.snapshot.provably_lost && state.snapshot.status === "in_progress";
+  banner.classList.toggle("hidden", !locked);
+  if (locked) {
+    banner.textContent =
+      "Partiet är kört. Varje kolumn har ett dött kort, så inget hål kan skapas igen – ge upp och blanda om.";
+  }
+}
+
 function updateStatus() {
   const snapshot = state.snapshot;
   document.getElementById("status-text").textContent = snapshot.status;
+  updateLostBanner();
   document.getElementById("stock-count").textContent = snapshot.stock_count;
   document.getElementById("sequence-count").textContent = snapshot.completed_sequences;
   document.getElementById("move-count").textContent = snapshot.moves_played;
@@ -400,9 +505,10 @@ function renderSuggestions() {
         suggestion.compact_model_score === null || suggestion.compact_model_score === undefined
           ? ""
           : ` | kompakt ${suggestion.compact_model_score.toFixed(3)}`;
-      return `<button class="suggestion-item" data-type="${suggestion.type}" data-from="${suggestion.from_column ?? ""}" data-to="${suggestion.to_column ?? ""}" data-run="${suggestion.run_length ?? ""}">
+      const lockPart = suggestion.locks_position ? ` | <span class="locks-position">låser partiet</span>` : "";
+      return `<button class="suggestion-item${suggestion.locks_position ? " locks" : ""}" data-type="${suggestion.type}" data-from="${suggestion.from_column ?? ""}" data-to="${suggestion.to_column ?? ""}" data-run="${suggestion.run_length ?? ""}">
         <span class="suggestion-main">${suggestion.description}</span>
-        <span class="suggestion-meta">${sourceBadge} | heuristik ${suggestion.heuristic_score.toFixed(1)}${searchPart}${modelPart}${holePart}${compactPart}</span>
+        <span class="suggestion-meta">${sourceBadge} | heuristik ${suggestion.heuristic_score.toFixed(1)}${searchPart}${modelPart}${holePart}${compactPart}${lockPart}</span>
       </button>`;
     })
     .join("");
@@ -487,6 +593,10 @@ function renderStockOverview() {
 function renderBoard() {
   const board = document.getElementById("board");
   board.innerHTML = "";
+  const movableKeys = state.markMovable ? movableCardKeys(state.snapshot) : new Set();
+  // Only trust the reachability result if it was computed for this position.
+  const reachable =
+    state.markReachable && state.reachableStateHash === state.snapshot.state_hash ? state.reachable : null;
 
   state.snapshot.columns.forEach((column, columnIndex) => {
     const columnElement = document.createElement("section");
@@ -550,6 +660,23 @@ function renderBoard() {
           cardIndex === column.cards.length - 1;
 
         cardElement.className = `card ${card.color} suit-${card.suit} ${movable ? "movable" : ""} ${selected ? "selected" : ""}`;
+        if (state.markMovable && movableKeys.has(`${columnIndex}:${cardIndex}`)) {
+          cardElement.classList.add("has-move");
+        }
+        // Depth 1 is already covered by .has-move, so only mark what needs
+        // more than one move - otherwise the two markings say the same thing.
+        const reachDepth = reachable ? reachable[card.code] : undefined;
+        if (reachDepth && reachDepth > 1) {
+          cardElement.classList.add("reachable-move");
+          cardElement.dataset.reachDepth = String(reachDepth);
+          cardElement.title = `Kan flyttas efter ${reachDepth} drag.`;
+        }
+        if (state.markDead && card.dead_marked) {
+          cardElement.classList.add("dead-card");
+          cardElement.title = card.dead_by_rule
+            ? "Dött kort: kan bara flyttas till ett hål."
+            : "Kung: död per definition, kan bara flyttas till ett hål.";
+        }
         if (isSuggestedSource) {
           cardElement.classList.add("suggestion-source");
         }
@@ -558,6 +685,14 @@ function renderBoard() {
         }
         cardElement.dataset.cardCode = card.code;
         cardElement.innerHTML = cardMarkup(card);
+        if (state.markDead && card.dead_marked) {
+          // Must come after innerHTML, which would otherwise wipe the badge.
+          const badge = document.createElement("span");
+          badge.className = `dead-badge ${card.dead_by_rule ? "" : "by-definition"}`;
+          badge.textContent = "✝";
+          badge.setAttribute("aria-hidden", "true");
+          cardElement.appendChild(badge);
+        }
         cardElement.style.top = `${cardIndex * 28}px`;
         if (movable) {
           cardElement.draggable = true;
@@ -604,6 +739,7 @@ function applySnapshot(snapshot) {
   storeActiveGameId(snapshot.game_id);
   syncUrlGameId(snapshot.game_id);
   render();
+  refreshReachable();
   if (autoAiEnabled() && snapshot.status === "in_progress") {
     loadSuggestions({ silentIfCurrent: true }).catch((error) => {
       state.feedbackStatus = error.message;
@@ -863,6 +999,26 @@ document.getElementById("undo").addEventListener("click", performUndo);
 document.getElementById("suggest").addEventListener("click", () => loadSuggestions());
 document.getElementById("concede").addEventListener("click", performConcede);
 document.getElementById("auto-ai").addEventListener("change", handleAutoAiToggle);
+
+function bindMarkingToggle(elementId, storageKey, stateKey, onChange) {
+  const input = document.getElementById(elementId);
+  state[stateKey] = readStoredFlag(storageKey);
+  input.checked = state[stateKey];
+  input.addEventListener("change", () => {
+    state[stateKey] = input.checked;
+    storeFlag(storageKey, input.checked);
+    if (state.snapshot) {
+      renderBoard();
+    }
+    if (onChange) {
+      onChange();
+    }
+  });
+}
+
+bindMarkingToggle("mark-dead", MARK_DEAD_STORAGE_KEY, "markDead");
+bindMarkingToggle("mark-movable", MARK_MOVABLE_STORAGE_KEY, "markMovable");
+bindMarkingToggle("mark-reachable", MARK_REACHABLE_STORAGE_KEY, "markReachable", refreshReachable);
 document.getElementById("pending-normal").addEventListener("click", () => saveCurrentPlannedFeedback("normal"));
 document.getElementById("pending-important").addEventListener("click", () => saveCurrentPlannedFeedback("important"));
 document.getElementById("pending-key").addEventListener("click", () => saveCurrentPlannedFeedback("key_move"));

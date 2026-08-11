@@ -25,9 +25,23 @@
             <input id="auto-ai" type="checkbox" checked />
             <span>AI auto</span>
           </label>
+          <label class="toggle">
+            <input id="mark-dead" type="checkbox" />
+            <span>Döda kort</span>
+          </label>
+          <label class="toggle">
+            <input id="mark-movable" type="checkbox" />
+            <span>Flyttbara</span>
+          </label>
+          <label class="toggle">
+            <input id="mark-reachable" type="checkbox" />
+            <span>Flyttbara i flera led</span>
+          </label>
           <button id="concede" class="danger">Ge upp</button>
         </div>
       </header>
+
+      <div id="lost-banner" class="lost-banner hidden" role="status"></div>
 
       <section class="status-panel">
         <div>

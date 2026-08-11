@@ -514,9 +514,31 @@ button.danger {
   color: #1e2a2f;
 }
 
+/* Sits on top of a colour run, so it can be picked up. That is an interaction
+   affordance, not a claim that the card has anywhere to go - roughly four in
+   ten pickable cards have no legal destination. The outline lives on
+   .has-move instead. */
 .card.movable {
-  outline: 2px solid rgba(15, 91, 74, 0.22);
   cursor: grab;
+}
+
+/* Has an actual legal destination right now. */
+.card.has-move {
+  outline: 2px solid rgba(15, 91, 74, 0.22);
+}
+
+/* Movable only after a sequence of moves. Dashed to separate it from the solid
+   "can move now" outline, and fainter the further away it is. */
+.card.reachable-move {
+  outline: 2px dashed rgba(15, 91, 74, 0.3);
+}
+
+.card.reachable-move[data-reach-depth="3"] {
+  outline-color: rgba(15, 91, 74, 0.18);
+}
+
+.card.reachable-move[data-reach-depth="4"] {
+  outline-color: rgba(15, 91, 74, 0.11);
 }
 
 .card.selected {
@@ -654,4 +676,57 @@ button.danger {
   .stock-row-cards {
     grid-template-columns: repeat(7, minmax(0, 1fr));
   }
+}
+
+.lost-banner {
+  margin: 0 0 1rem;
+  padding: 0.85rem 1.1rem;
+  border-radius: 14px;
+  border-left: 0.45rem solid #b3261e;
+  background: rgba(179, 38, 30, 0.1);
+  color: #7c1710;
+  font-weight: 700;
+}
+
+.lost-banner.hidden {
+  display: none;
+}
+
+/* Dead card: can only ever be moved into a hole. Kings are included - they are
+   dead by definition rather than derived, but marking them makes the whole
+   marking checkable by eye. */
+.card.dead-card {
+  /* Kept deliberately quiet: the badge carries the signal, the card face
+     should still read as a normal card. */
+  background: color-mix(in srgb, var(--card) 96%, #b3261e);
+}
+
+.dead-badge {
+  position: absolute;
+  top: 0.3rem;
+  right: 0.4rem;
+  z-index: 3;
+  font-size: 0.7rem;
+  line-height: 1;
+  color: #b3261e;
+  opacity: 0.4;
+}
+
+/* A king is dead by definition, so its badge is quieter than a derived one. */
+.dead-badge.by-definition {
+  opacity: 0.22;
+}
+
+.suggestion-item.locks {
+  opacity: 0.65;
+}
+
+.locks-position {
+  color: #b3261e;
+  font-weight: 700;
+}
+
+.toggle.failed span {
+  color: #b3261e;
+  text-decoration: underline dotted;
 }

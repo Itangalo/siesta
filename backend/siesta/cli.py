@@ -14,6 +14,8 @@ from .training import (
     evaluate_compact_goal,
     evaluate_policy,
     evaluate_hole_goal,
+    improve_policy_from_beam_search_wins,
+    improve_policy_from_winning_rollouts,
     load_compact_model,
     load_latest_model,
     load_hole_model,
@@ -39,6 +41,7 @@ def command_generate_data(args: argparse.Namespace) -> None:
     features, labels = build_training_examples(
         num_games=args.games,
         teacher_policy=args.teacher_policy,
+        state_source=args.state_source,
         progress=console_progress,
     )
     output = Path(args.output)
@@ -55,6 +58,43 @@ def command_train_policy(args: argparse.Namespace) -> None:
         hidden_dim=args.hidden_dim,
         teacher_policy=args.teacher_policy,
         benchmark_games=args.benchmark_games,
+        training_state_source=args.state_source,
+        progress=console_progress,
+    )
+    print(json.dumps(strip_episodes(result), indent=2))
+
+
+def command_improve_policy_wins(args: argparse.Namespace) -> None:
+    result = improve_policy_from_winning_rollouts(
+        num_games=args.games,
+        rollouts_per_game=args.rollouts_per_game,
+        epochs=args.epochs,
+        learning_rate=args.learning_rate,
+        hidden_dim=args.hidden_dim,
+        benchmark_games=args.benchmark_games,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        epsilon_random=args.epsilon_random,
+        max_moves=args.max_moves,
+        stagnation_limit=args.stagnation_limit,
+        repeat_limit=args.repeat_limit,
+        progress=console_progress,
+    )
+    print(json.dumps(strip_episodes(result), indent=2))
+
+
+def command_improve_policy_beam_wins(args: argparse.Namespace) -> None:
+    result = improve_policy_from_beam_search_wins(
+        num_games=args.games,
+        epochs=args.epochs,
+        learning_rate=args.learning_rate,
+        hidden_dim=args.hidden_dim,
+        benchmark_games=args.benchmark_games,
+        beam_width=args.beam_width,
+        branching_factor=args.branching_factor,
+        max_nodes_per_game=args.max_nodes_per_game,
+        max_moves=args.max_moves,
+        max_wins_per_game=args.max_wins_per_game,
         progress=console_progress,
     )
     print(json.dumps(strip_episodes(result), indent=2))
@@ -113,6 +153,7 @@ def command_train_compact_policy(args: argparse.Namespace) -> None:
         hidden_dim=args.hidden_dim,
         benchmark_games=args.benchmark_games,
         horizon=args.horizon,
+        midgame_share=args.midgame_share,
         progress=console_progress,
     )
     print(json.dumps(strip_episodes(result), indent=2))
@@ -139,6 +180,7 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--games", type=int, default=60)
     generate.add_argument("--output", default="backend/models/training-data.npz")
     generate.add_argument("--teacher-policy", choices=["heuristic", "search"], default="search")
+    generate.add_argument("--state-source", choices=["random_seed", "won_initial_states"], default="random_seed")
     generate.set_defaults(func=command_generate_data)
 
     train = subparsers.add_parser("train-policy")
@@ -148,7 +190,36 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--hidden-dim", type=int, default=64)
     train.add_argument("--teacher-policy", choices=["heuristic", "search"], default="search")
     train.add_argument("--benchmark-games", type=int, default=20)
+    train.add_argument("--state-source", choices=["random_seed", "won_initial_states"], default="won_initial_states")
     train.set_defaults(func=command_train_policy)
+
+    improve = subparsers.add_parser("improve-policy-wins")
+    improve.add_argument("--games", type=int, default=20)
+    improve.add_argument("--rollouts-per-game", type=int, default=32)
+    improve.add_argument("--epochs", type=int, default=20)
+    improve.add_argument("--learning-rate", type=float, default=0.02)
+    improve.add_argument("--hidden-dim", type=int, default=256)
+    improve.add_argument("--benchmark-games", type=int, default=20)
+    improve.add_argument("--temperature", type=float, default=1.0)
+    improve.add_argument("--top-k", type=int, default=3)
+    improve.add_argument("--epsilon-random", type=float, default=0.08)
+    improve.add_argument("--max-moves", type=int, default=180)
+    improve.add_argument("--stagnation-limit", type=int, default=30)
+    improve.add_argument("--repeat-limit", type=int, default=3)
+    improve.set_defaults(func=command_improve_policy_wins)
+
+    beam_improve = subparsers.add_parser("improve-policy-beam-wins")
+    beam_improve.add_argument("--games", type=int, default=19)
+    beam_improve.add_argument("--epochs", type=int, default=10)
+    beam_improve.add_argument("--learning-rate", type=float, default=0.02)
+    beam_improve.add_argument("--hidden-dim", type=int, default=256)
+    beam_improve.add_argument("--benchmark-games", type=int, default=20)
+    beam_improve.add_argument("--beam-width", type=int, default=48)
+    beam_improve.add_argument("--branching-factor", type=int, default=6)
+    beam_improve.add_argument("--max-nodes-per-game", type=int, default=4000)
+    beam_improve.add_argument("--max-moves", type=int, default=180)
+    beam_improve.add_argument("--max-wins-per-game", type=int, default=1)
+    beam_improve.set_defaults(func=command_improve_policy_beam_wins)
 
     evaluate = subparsers.add_parser("evaluate-policy")
     evaluate.add_argument("--policy", choices=["heuristic", "random", "search", "model"], default="heuristic")
@@ -188,6 +259,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_compact.add_argument("--hidden-dim", type=int, default=64)
     train_compact.add_argument("--benchmark-games", type=int, default=50)
     train_compact.add_argument("--horizon", type=int, default=5)
+    train_compact.add_argument("--midgame-share", type=float, default=0.4)
     train_compact.set_defaults(func=command_train_compact_policy)
 
     train_hole = subparsers.add_parser("train-hole-policy")

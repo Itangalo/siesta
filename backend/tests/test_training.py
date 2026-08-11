@@ -3,8 +3,9 @@ import json
 import numpy as np
 
 import backend.siesta.training as training_module
-from backend.siesta.game import Card, GameState
+from backend.siesta.game import Card, GameState, create_game
 from backend.siesta.training import (
+    RolloutTraceStep,
     best_hole_goal_outcome,
     benchmark_compact_goal,
     benchmark_hole_goal,
@@ -13,6 +14,8 @@ from backend.siesta.training import (
     TrainingCase,
     blocked_mid_rank_risk,
     benchmark_policies,
+    build_cases_from_winning_rollouts,
+    build_compact_midgame_cases,
     build_compact_opening_cases,
     build_hole_opening_cases,
     build_training_cases,
@@ -21,20 +24,37 @@ from backend.siesta.training import (
     compactness_goal_state_score,
     effective_column_mass,
     effective_column_units,
+    encode_action,
     expand_human_cases_for_training,
     evaluate_policy,
     hole_access_score,
+    improve_policy_from_beam_search_wins,
+    improve_policy_from_winning_rollouts,
     human_case_repeat_factor,
     load_human_feedback_cases,
+    load_winning_initial_states,
     progress_score,
     rank_actions_for_state,
     training_game_seeds,
     top_color_mix_penalty,
+    visible_tableau_card_features,
 )
 
 
 def make_state(columns, stock=None):
     return GameState(columns=columns, stock=stock or [])
+
+
+def serialize_game_state(state):
+    return {
+        "columns": [[card.to_dict() for card in column] for column in state.columns],
+        "stock": [card.to_dict() for card in state.stock],
+        "status": state.status,
+        "moves_played": state.moves_played,
+        "terminal_reason": state.terminal_reason,
+        "state_hash": state.state_hash,
+        "completed_sequences": state.completed_sequences,
+    }
 
 
 def test_search_action_returns_legal_action():
@@ -97,6 +117,155 @@ def test_training_cases_capture_ranked_choice():
     assert all(case.weight >= 1.0 for case in cases)
     assert all(case.soft_targets.shape[0] == len(case.action_signatures) for case in cases)
     assert all(abs(float(case.soft_targets.sum()) - 1.0) < 1e-5 for case in cases)
+
+
+def test_load_winning_initial_states_returns_only_won_sessions(tmp_path):
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    won_state = create_game(seed=11)
+    conceded_state = create_game(seed=12)
+
+    (sessions_dir / "won.json").write_text(
+        json.dumps(
+            {
+                "game_id": "won-game",
+                "history": [
+                    serialize_game_state(won_state),
+                    {"status": "won"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (sessions_dir / "conceded.json").write_text(
+        json.dumps(
+            {
+                "game_id": "conceded-game",
+                "history": [
+                    serialize_game_state(conceded_state),
+                    {"status": "conceded"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    initial_states = load_winning_initial_states(sessions_dir=sessions_dir)
+
+    assert [item.source_id for item in initial_states] == ["won-game"]
+    assert initial_states[0].source_type == "won_initial_state"
+    assert initial_states[0].state.state_hash == won_state.state_hash
+
+
+def test_build_training_cases_can_start_from_winning_initial_states(tmp_path):
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    for index, seed in enumerate((21, 22), start=1):
+        state = create_game(seed=seed)
+        (sessions_dir / f"won-{index}.json").write_text(
+            json.dumps(
+                {
+                    "game_id": f"won-{index}",
+                    "history": [
+                        serialize_game_state(state),
+                        {"status": "won"},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    cases = build_training_cases(
+        num_games=3,
+        max_moves=4,
+        teacher_policy="search",
+        search_depth=1,
+        beam_width=2,
+        rollout_steps=2,
+        alternate_actions=0,
+        max_states_per_game=1,
+        state_source="won_initial_states",
+        sessions_dir=sessions_dir,
+    )
+
+    assert cases
+    assert all(case.source == "generated" for case in cases)
+
+
+def test_visible_tableau_card_features_capture_buried_card_identity():
+    state_a = make_state(
+        [
+            [Card(9, "hearts"), Card(8, "spades")],
+            [Card(9, "clubs")],
+            [],
+            [],
+            [],
+            [],
+            [],
+        ],
+        stock=[Card(1, "hearts")],
+    )
+    state_b = make_state(
+        [
+            [Card(9, "diamonds"), Card(8, "spades")],
+            [Card(9, "clubs")],
+            [],
+            [],
+            [],
+            [],
+            [],
+        ],
+        stock=[Card(1, "spades")],
+    )
+
+    assert not np.array_equal(visible_tableau_card_features(state_a), visible_tableau_card_features(state_b))
+
+
+def test_encode_action_does_not_depend_on_hidden_stock_order_for_deal():
+    columns = [
+        [Card(6, "hearts")],
+        [Card(7, "spades")],
+        [Card(8, "clubs")],
+        [Card(9, "diamonds")],
+        [Card(10, "clubs")],
+        [Card(11, "hearts")],
+        [Card(12, "spades")],
+    ]
+    stock_a = [Card(1, "hearts"), Card(2, "hearts"), Card(3, "hearts"), Card(4, "hearts")]
+    stock_b = list(reversed(stock_a))
+    state_a = make_state(columns=[list(column) for column in columns], stock=stock_a)
+    state_b = make_state(columns=[list(column) for column in columns], stock=stock_b)
+    action = training_module.Action(type="deal")
+
+    encoded_a = encode_action(state_a, action)
+    encoded_b = encode_action(state_b, action)
+
+    assert np.array_equal(encoded_a, encoded_b)
+
+
+def test_build_cases_from_winning_rollouts_aggregates_duplicate_decisions():
+    state = make_state(
+        [
+            [Card(6, "hearts")],
+            [Card(7, "spades")],
+            [],
+            [],
+            [],
+            [],
+            [],
+        ]
+    )
+    action = training_module.available_actions(state)[0]
+    episodes = [
+        {"trace": [RolloutTraceStep(state=state.clone(), action=action)]},
+        {"trace": [RolloutTraceStep(state=state.clone(), action=action)]},
+    ]
+
+    cases = build_cases_from_winning_rollouts(episodes)
+
+    assert len(cases) == 1
+    assert cases[0].weight == 2.0
+    assert cases[0].source == "self_win"
 
 
 def test_rank_teacher_search_actions_uses_hole_search_for_opening(monkeypatch):
@@ -213,6 +382,13 @@ def test_build_compact_opening_cases_generates_ranked_examples():
     cases = build_compact_opening_cases(num_games=3, horizon=3, beam_width=4)
     assert cases
     assert all(case.source == "compact_opening" for case in cases)
+    assert all(case.features.shape[0] == len(case.action_signatures) for case in cases)
+
+
+def test_build_compact_midgame_cases_generates_ranked_examples():
+    cases = build_compact_midgame_cases(num_games=3, horizon=3, beam_width=4, min_steps=2, max_steps=4)
+    assert cases
+    assert all(case.source == "compact_midgame" for case in cases)
     assert all(case.features.shape[0] == len(case.action_signatures) for case in cases)
 
 
@@ -837,3 +1013,228 @@ def test_training_does_not_replace_active_model_with_worse_candidate(tmp_path, m
     assert result["active_model_evaluation"]["average_progress"] == 2.6
     assert active_metadata["model_evaluation"]["average_progress"] == 2.6
     assert candidate_metadata["candidate_model_evaluation"]["average_progress"] == 2.4
+
+
+def test_train_policy_uses_winning_initial_states_by_default(monkeypatch):
+    case = TrainingCase(
+        features=np.zeros((2, 4), dtype=np.float32),
+        target_index=0,
+        weight=1.0,
+        chosen_signature="a",
+        action_signatures=["a", "b"],
+        soft_targets=np.asarray([0.9, 0.1], dtype=np.float32),
+    )
+    build_kwargs = {}
+
+    def fake_build_training_cases(**kwargs):
+        build_kwargs.update(kwargs)
+        return [case]
+
+    monkeypatch.setattr(training_module, "build_training_cases", fake_build_training_cases)
+
+    def fail_load_human_feedback_cases(**kwargs):
+        raise AssertionError("human feedback should be disabled for won_initial_states training")
+
+    monkeypatch.setattr(training_module, "load_human_feedback_cases", fail_load_human_feedback_cases)
+    monkeypatch.setattr(
+        training_module,
+        "evaluate_policy",
+        lambda policy, model=None, seeds=None, progress=None, **kwargs: {
+            "policy": policy,
+            "games": len(list(seeds)),
+            "win_rate": 0.0,
+            "average_progress": 0.0,
+            "average_completed_sequences": 0.0,
+        },
+    )
+
+    training_module.train_policy_model(num_games=1, epochs=1, benchmark_games=2)
+
+    assert build_kwargs["state_source"] == "won_initial_states"
+
+
+def test_improve_policy_from_winning_rollouts_trains_on_successes(monkeypatch):
+    start_state = make_state(
+        [
+            [Card(6, "hearts")],
+            [Card(7, "spades")],
+            [],
+            [],
+            [],
+            [],
+            [],
+        ]
+    )
+    chosen_action = training_module.available_actions(start_state)[0]
+    start = training_module.TrainingStartState(source_id="seed-a", state=start_state, source_type="won_initial_state")
+    active_model = NumpyPolicyNetwork(input_dim=training_module.current_input_dim(), hidden_dim=8)
+
+    monkeypatch.setattr(training_module, "training_start_states", lambda **kwargs: [start])
+    monkeypatch.setattr(training_module, "load_latest_model", lambda: active_model)
+    monkeypatch.setattr(training_module, "load_model_metadata", lambda: {})
+    monkeypatch.setattr(training_module, "save_candidate_checkpoint", lambda model, metadata: None)
+    monkeypatch.setattr(training_module, "promote_candidate_checkpoint", lambda metadata: None)
+    monkeypatch.setattr(
+        training_module,
+        "play_self_win_rollout",
+        lambda *args, **kwargs: {
+            "status": "won",
+            "terminal_reason": "won",
+            "moves_played": 1,
+            "progress_score": 5.0,
+            "completed_sequences": 1,
+            "trace": [RolloutTraceStep(state=start_state.clone(), action=chosen_action)],
+            "final_state": start_state,
+        },
+    )
+
+    def fake_evaluate_policy(policy, model=None, seeds=None, progress=None, **kwargs):
+        if policy != "model":
+            return {
+                "policy": policy,
+                "games": len(list(seeds)),
+                "win_rate": 0.0,
+                "average_progress": 0.5,
+                "average_completed_sequences": 0.0,
+            }
+        return {
+            "policy": "model",
+            "games": len(list(seeds)),
+            "win_rate": 0.0,
+            "average_progress": 0.4 if model is active_model else 0.8,
+            "average_completed_sequences": 0.0,
+        }
+
+    monkeypatch.setattr(training_module, "evaluate_policy", fake_evaluate_policy)
+
+    result = improve_policy_from_winning_rollouts(
+        num_games=1,
+        rollouts_per_game=2,
+        epochs=1,
+        hidden_dim=8,
+        benchmark_games=2,
+    )
+
+    assert result["winning_rollouts"] == 2
+    assert result["training_cases"] == 1
+    assert result["model_initialization"] == "active_checkpoint"
+    assert result["promoted_to_active"] is True
+
+
+def test_improve_policy_from_beam_search_wins_trains_on_successes(monkeypatch):
+    start_state = make_state(
+        [
+            [Card(6, "hearts")],
+            [Card(7, "spades")],
+            [],
+            [],
+            [],
+            [],
+            [],
+        ]
+    )
+    chosen_action = training_module.available_actions(start_state)[0]
+    start = training_module.TrainingStartState(source_id="seed-a", state=start_state, source_type="won_initial_state")
+    active_model = NumpyPolicyNetwork(input_dim=training_module.current_input_dim(), hidden_dim=8)
+
+    monkeypatch.setattr(training_module, "training_start_states", lambda **kwargs: [start])
+    monkeypatch.setattr(training_module, "load_latest_model", lambda: active_model)
+    monkeypatch.setattr(training_module, "load_model_metadata", lambda: {})
+    monkeypatch.setattr(training_module, "save_candidate_checkpoint", lambda model, metadata: None)
+    monkeypatch.setattr(training_module, "promote_candidate_checkpoint", lambda metadata: None)
+    monkeypatch.setattr(
+        training_module,
+        "search_winning_episodes_from_state",
+        lambda *args, **kwargs: {
+            "winning_episodes": [
+                {
+                    "status": "won",
+                    "terminal_reason": "won",
+                    "moves_played": 1,
+                    "progress_score": 5.0,
+                    "completed_sequences": 1,
+                    "trace": [RolloutTraceStep(state=start_state.clone(), action=chosen_action)],
+                    "final_state": start_state,
+                }
+            ],
+            "expanded_nodes": 10,
+            "best_progress": 5.0,
+        },
+    )
+
+    def fake_evaluate_policy(policy, model=None, seeds=None, progress=None, **kwargs):
+        if policy != "model":
+            return {
+                "policy": policy,
+                "games": len(list(seeds)),
+                "win_rate": 0.0,
+                "average_progress": 0.5,
+                "average_completed_sequences": 0.0,
+            }
+        return {
+            "policy": "model",
+            "games": len(list(seeds)),
+            "win_rate": 0.0,
+            "average_progress": 0.4 if model is active_model else 0.8,
+            "average_completed_sequences": 0.0,
+        }
+
+    monkeypatch.setattr(training_module, "evaluate_policy", fake_evaluate_policy)
+
+    result = improve_policy_from_beam_search_wins(
+        num_games=1,
+        epochs=1,
+        hidden_dim=8,
+        benchmark_games=2,
+    )
+
+    assert result["winning_episodes"] == 1
+    assert result["training_cases"] == 1
+    assert result["model_initialization"] == "active_checkpoint"
+    assert result["promoted_to_active"] is True
+
+
+def _stock_state(columns, stock):
+    return GameState(columns=columns, stock=stock)
+
+
+def test_destination_supply_counts_exposed_and_undealt_targets():
+    columns = [[Card(rank=7, suit="spades")], [Card(rank=4, suit="hearts")], [], [], [], [], []]
+    state = _stock_state(columns, [Card(rank=7, suit="hearts"), Card(rank=7, suit="clubs")])
+    supply = training_module.destination_supply(state, 6)
+    assert supply == 1.0 + 2 * training_module.STOCK_DESTINATION_WEIGHT
+
+
+def test_a_king_has_no_destination_supply():
+    state = _stock_state([[Card(rank=5, suit="hearts")]] + [[] for _ in range(6)], [])
+    assert training_module.destination_supply(state, 13) == 0.0
+
+
+def test_hole_is_preferably_filled_with_a_recoverable_card():
+    # A six and a king are both loose; sevens are still in the stock, so the six
+    # is the tenant that can hand the hole back.
+    columns = [
+        [Card(rank=6, suit="hearts")],
+        [Card(rank=13, suit="spades")],
+        [],
+        [Card(rank=2, suit="clubs")],
+        [Card(rank=3, suit="clubs")],
+        [Card(rank=4, suit="clubs")],
+        [Card(rank=5, suit="clubs")],
+    ]
+    state = _stock_state(columns, [Card(rank=7, suit="hearts"), Card(rank=7, suit="clubs")])
+    actions = [
+        action
+        for action in training_module.available_actions(state)
+        if action.type == "move" and not state.columns[action.move.to_column]
+    ]
+    previous = training_module.HOLE_TENANT_WEIGHT
+    training_module.HOLE_TENANT_WEIGHT = 3.0
+    try:
+        scored = {
+            state.columns[action.move.from_column][-1].rank: training_module.evaluate_action(state, action)
+            for action in actions
+        }
+    finally:
+        training_module.HOLE_TENANT_WEIGHT = previous
+    assert scored[6] > scored[13]
