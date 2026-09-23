@@ -161,15 +161,6 @@ button.danger {
   padding-top: 0.9rem;
 }
 
-.capture-row {
-  display: flex;
-  gap: 0.8rem;
-  align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  margin-top: 0.2rem;
-}
-
 .suggestions {
   display: grid;
   gap: 0.5rem;
@@ -182,41 +173,6 @@ button.danger {
   margin-top: 0.65rem;
   color: var(--muted);
   font-size: 0.95rem;
-}
-
-.feedback-panel {
-  margin-top: 0.8rem;
-  padding: 0.9rem 1rem;
-  border-radius: 16px;
-  background: rgba(15, 91, 74, 0.08);
-  display: flex;
-  gap: 0.8rem;
-  align-items: flex-start;
-  justify-content: space-between;
-}
-
-.feedback-panel.hidden {
-  display: none;
-}
-
-.feedback-title {
-  font-size: 0.8rem;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--muted);
-  margin-bottom: 0.25rem;
-}
-
-.feedback-title.inline {
-  margin-bottom: 0;
-}
-
-.last-feedback-row {
-  display: flex;
-  gap: 0.8rem;
-  align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
 }
 
 .feedback-actions {
@@ -655,8 +611,7 @@ button.danger {
   }
 
   .panel-header,
-  .board-callout,
-  .feedback-panel {
+  .board-callout {
     flex-direction: column;
     align-items: stretch;
   }
@@ -692,6 +647,92 @@ button.danger {
   display: none;
 }
 
+/* Win celebration */
+.win-banner {
+  margin: 0 0 1rem;
+  padding: 1.1rem 1.3rem;
+  border-radius: 18px;
+  text-align: center;
+  font-size: 1.25rem;
+  font-weight: 800;
+  color: #3d2c05;
+  background:
+    linear-gradient(135deg, rgba(255, 215, 130, 0.85), rgba(240, 178, 62, 0.85)),
+    var(--panel);
+  border: 1px solid rgba(176, 124, 18, 0.45);
+  box-shadow: var(--shadow), 0 0 44px rgba(240, 178, 62, 0.35);
+}
+
+.win-banner.hidden {
+  display: none;
+}
+
+.win-banner.show {
+  animation: win-pop 0.7s cubic-bezier(0.2, 1.6, 0.4, 1);
+}
+
+@keyframes win-pop {
+  0% {
+    transform: scale(0.6);
+    opacity: 0;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+.confetti-layer {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 60;
+}
+
+.confetti-piece {
+  position: absolute;
+  top: -6%;
+  animation-name: confetti-fall;
+  animation-timing-function: linear;
+  animation-fill-mode: forwards;
+}
+
+.confetti-layer.rise .confetti-piece {
+  top: auto;
+  bottom: -6%;
+  animation-name: confetti-rise;
+}
+
+.confetti-inner {
+  display: inline-block;
+  animation-name: confetti-sway;
+  animation-timing-function: ease-in-out;
+  animation-iteration-count: infinite;
+  animation-direction: alternate;
+}
+
+@keyframes confetti-fall {
+  to {
+    transform: translateY(112vh) rotate(680deg);
+  }
+}
+
+@keyframes confetti-rise {
+  to {
+    transform: translateY(-112vh) rotate(-680deg);
+  }
+}
+
+@keyframes confetti-sway {
+  from {
+    transform: translateX(-1.6rem) rotate(-24deg);
+  }
+  to {
+    transform: translateX(1.6rem) rotate(24deg);
+  }
+}
+
 /* Dead card: can only ever be moved into a hole. Kings are included - they are
    dead by definition rather than derived, but marking them makes the whole
    marking checkable by eye. */
@@ -717,16 +758,31 @@ button.danger {
   opacity: 0.22;
 }
 
-.suggestion-item.locks {
-  opacity: 0.65;
-}
-
-.locks-position {
-  color: #b3261e;
-  font-weight: 700;
-}
-
 .toggle.failed span {
   color: #b3261e;
   text-decoration: underline dotted;
+}
+
+/* Endgame advice panel */
+.advice-line {
+  margin: 10px 0 0;
+  padding-left: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.advice-step {
+  font-size: 13px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: rgba(127, 127, 127, 0.12);
+}
+
+.advice-step-number {
+  display: inline-block;
+  min-width: 18px;
+  opacity: 0.65;
+  font-weight: 700;
 }

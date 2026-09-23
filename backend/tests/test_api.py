@@ -171,3 +171,104 @@ def test_undo_appends_feedback_invalidation_for_last_action(tmp_path, monkeypatc
     assert rows[-1]["record_type"] == "invalidation"
     assert rows[-1]["state_hash"] == snapshot["state_hash"]
     assert rows[-1]["chosen_action"]["type"] == "deal"
+
+
+def test_solve_advice_midgame_returns_recommendation():
+    response = client.post("/game/new", json={"seed": 3})
+    game_id = response.json()["game_id"]
+    result = client.post("/ai/solve-advice", json={"game_id": game_id, "budget_s": 3})
+    assert result.status_code == 200
+    data = result.json()
+    assert data["mode"] in {"midgame", "endgame", "won", "stuck", "over"}
+    assert "message" in data
+    if data["mode"] == "midgame":
+        assert data["recommended_action"] is not None
+
+
+def test_solve_advice_unknown_game_is_404():
+    response = client.post("/ai/solve-advice", json={"game_id": "does-not-exist"})
+    assert response.status_code == 404
+
+
+def test_solve_advice_proven_win_line():
+    from backend.siesta.game import Card, GameState
+
+    def stack(suit, top=13):
+        return [Card(rank=rank, suit=suit) for rank in range(top, 0, -1)]
+
+    columns = [
+        stack("hearts"),
+        stack("diamonds"),
+        stack("spades"),
+        stack("clubs")[:6],
+        stack("clubs")[6:],
+        [],
+        [],
+    ]
+    state = GameState(columns=[list(c) for c in columns], stock=[], moves_played=40)
+    session = api_module.store.create(seed=99)
+    session.history = [state]
+    session.actions = []
+
+    result = client.post("/ai/solve-advice", json={"game_id": session.game_id, "budget_s": 10})
+    data = result.json()
+    assert data["mode"] == "endgame"
+    assert data["can_win"] is True
+    assert len(data["win_line"]) == 1
+    assert data["recommended_action"] == data["win_line"][0]
+
+
+def test_solve_advice_already_won_position():
+    from backend.siesta.game import Card, GameState
+
+    def stack(suit):
+        return [Card(rank=rank, suit=suit) for rank in range(13, 0, -1)]
+
+    state = GameState(
+        columns=[stack("hearts"), stack("diamonds"), stack("clubs"), stack("spades"), [], [], []],
+        stock=[],
+        moves_played=50,
+    )
+    session = api_module.store.create(seed=98)
+    session.history = [state]
+    session.actions = []
+
+    result = client.post("/ai/solve-advice", json={"game_id": session.game_id})
+    assert result.json()["mode"] == "won"
+
+
+def test_ai_suggestions_come_from_solver_engine():
+    response = client.post("/game/new", json={"seed": 3})
+    game_id = response.json()["game_id"]
+    payload = client.post("/ai/evaluate-move", json={"game_id": game_id}).json()
+    assert payload["ranking_source"].startswith("solver")
+    assert payload["suggestions"], "expected at least one suggestion"
+    first = payload["suggestions"][0]
+    assert first["description"].startswith("Plan ")
+    assert isinstance(first["heuristic_score"], float)
+
+
+def test_ai_suggestions_endgame_win_line():
+    from backend.siesta.game import Card, GameState
+
+    def stack(suit, top=13):
+        return [Card(rank=rank, suit=suit) for rank in range(top, 0, -1)]
+
+    columns = [
+        stack("hearts"),
+        stack("diamonds"),
+        stack("spades"),
+        stack("clubs")[:6],
+        stack("clubs")[6:],
+        [],
+        [],
+    ]
+    state = GameState(columns=[list(c) for c in columns], stock=[], moves_played=40)
+    session = api_module.store.create(seed=97)
+    session.history = [state]
+    session.actions = []
+
+    payload = client.post("/ai/evaluate-move", json={"game_id": session.game_id}).json()
+    assert payload["ranking_source"] == "solver+vinstlinje"
+    assert payload["suggestions"]
+    assert payload["suggestions"][0]["description"].startswith("Vinstlinje ")

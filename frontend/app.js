@@ -35,6 +35,13 @@ const RANK_LABELS = {
   13: "K",
 };
 
+const WIN_MESSAGES = [
+  "Patiensen gick ut! Snyggt spelat.",
+  "Alla fyra färgstegar kompletta – grattis!",
+  "Siesta avklarad. Fyra sviter, noll kort kvar.",
+  "Fullbokat: kung till ess i alla färger!",
+];
+
 const FEEDBACK_LABELS = {
   normal: "sparad",
   important: "viktig korrigering",
@@ -42,12 +49,12 @@ const FEEDBACK_LABELS = {
 };
 
 const ACTIVE_GAME_STORAGE_KEY = "siesta.activeGameId";
-const CAPTURE_STRENGTH_STORAGE_KEY = "siesta.captureStrength";
 const MARK_DEAD_STORAGE_KEY = "siesta.markDead";
 const MARK_MOVABLE_STORAGE_KEY = "siesta.markMovable";
 const MARK_REACHABLE_STORAGE_KEY = "siesta.markReachable";
 const REACHABLE_DEPTH = 4;
 const AI_REQUEST_TIMEOUT_MS = 3500;
+const ADVICE_REQUEST_TIMEOUT_MS = 150000;
 
 const state = {
   gameId: null,
@@ -58,19 +65,19 @@ const state = {
   aiContext: null,
   feedbackStatus: "",
   savedFeedbackKeys: new Set(),
-  lastFeedback: null,
   hoveredCardCode: null,
   hoveredSuggestion: null,
   aiRequestId: 0,
   aiLoading: false,
   aiAbortController: null,
-  lastFeedbackStrength: null,
-  captureStrength: "normal",
   markDead: false,
   markMovable: false,
   markReachable: false,
   reachable: null,
   reachableStateHash: null,
+  advice: null,
+  adviceLoading: false,
+  celebratedGameId: null,
 };
 
 /**
@@ -235,23 +242,6 @@ function storeActiveGameId(gameId) {
   }
 }
 
-function readStoredCaptureStrength() {
-  try {
-    const value = window.localStorage.getItem(CAPTURE_STRENGTH_STORAGE_KEY);
-    return value === "important" || value === "key_move" ? value : "normal";
-  } catch (_) {
-    return "normal";
-  }
-}
-
-function storeCaptureStrength(strength) {
-  try {
-    window.localStorage.setItem(CAPTURE_STRENGTH_STORAGE_KEY, strength);
-  } catch (_) {
-    // Ignore storage errors; the game still works without persistence.
-  }
-}
-
 function syncUrlGameId(gameId) {
   try {
     const url = new URL(window.location.href);
@@ -290,9 +280,9 @@ function feedbackKey(stateHash, action, strength, appliesTo) {
 
 function rankingSource() {
   if (!state.aiContext) {
-    return "search";
+    return "solver";
   }
-  return state.aiContext.rankingSource || (state.aiContext.modelEligible ? "model" : "search");
+  return state.aiContext.rankingSource || "solver";
 }
 
 function selectedRunLength(columnIndex, cardIndex) {
@@ -333,29 +323,13 @@ function buildFeedbackEntry(chosenAction) {
   };
 }
 
-function currentPlannedFeedbackEntry() {
-  if (!state.selection || state.selectionTarget === null) {
-    return null;
-  }
-  const chosenAction = chosenMoveAction(state.selection.fromColumn, state.selectionTarget, state.selection.runLength);
-  return buildFeedbackEntry(chosenAction);
-}
-
 function updateFeedbackPanel() {
   const summary = document.getElementById("ai-summary");
-  const pendingPanel = document.getElementById("pending-feedback-panel");
-  const pendingText = document.getElementById("pending-feedback-text");
-  const lastPanel = document.getElementById("board-callout");
-  const lastText = document.getElementById("last-feedback-text");
   const status = document.getElementById("feedback-status");
   status.textContent = state.feedbackStatus;
 
   if (state.aiLoading && (!state.aiContext || state.aiContext.stateHash !== state.snapshot?.state_hash)) {
     summary.textContent = "AI analyserar nuvarande läge...";
-    pendingPanel.classList.add("hidden");
-    lastPanel.classList.add("hidden");
-    pendingText.textContent = "";
-    lastText.textContent = "";
     return;
   }
 
@@ -363,88 +337,74 @@ function updateFeedbackPanel() {
     summary.textContent = autoAiEnabled()
       ? "AI auto är på. Förslag laddas automatiskt för nuvarande läge."
       : "Ladda AI-förslag för att se hur agenten resonerar.";
-    pendingPanel.classList.add("hidden");
-    pendingText.textContent = "";
   } else {
     const sourceMap = {
-      model: "modellen",
-      search: "search-läraren",
-      "model+hole": "modellen + hålmodellen",
-      "search+hole": "search + hålmodellen",
-      "model+compact": "modellen + compactness-modellen",
-      "search+compact": "search + compactness-modellen",
-      "model+hole+compact": "modellen + hålmodellen + compactness-modellen",
-      "search+hole+compact": "search + hålmodellen + compactness-modellen",
+      solver: "sökandemotorn",
+      "solver+vinstlinje": "sökandemotorn (bevisad vinstlinje)",
     };
     const source = sourceMap[rankingSource()] || rankingSource();
     const top = state.aiContext.suggestions[0];
-    const searchPart = top.search_score === null || top.search_score === undefined ? "" : ` | search ${top.search_score.toFixed(1)}`;
-    const modelPart = top.model_score === null || top.model_score === undefined ? "" : ` | modell ${top.model_score.toFixed(2)}`;
-    const holePart = top.hole_model_score === null || top.hole_model_score === undefined ? "" : ` | hål ${top.hole_model_score.toFixed(2)}`;
-    const compactPart = top.compact_model_score === null || top.compact_model_score === undefined ? "" : ` | kompakt ${top.compact_model_score.toFixed(2)}`;
-    summary.textContent = `Aktiv AI-källa: ${source}. Toppförslag: ${top.description}${searchPart}${modelPart}${holePart}${compactPart}.`;
-
-    const candidate = currentPlannedFeedbackEntry();
-    if (!candidate || !candidate.topSuggestion || actionKey(candidate.chosenAction) === actionKey(candidate.topSuggestion)) {
-      pendingPanel.classList.add("hidden");
-      pendingText.textContent = "";
-    } else {
-      pendingPanel.classList.remove("hidden");
-      pendingText.textContent = `Om du tänker spela ${candidate.chosenAction.description} i stället för AI:ns toppförslag ${candidate.topSuggestion.description}, markera det här innan du gör draget.`;
-    }
+    summary.textContent = `Aktiv AI-källa: ${source}. Toppförslag: ${top.description}.`;
   }
+}
 
-  if (!state.lastFeedback) {
-    lastPanel.classList.add("hidden");
-    lastText.textContent = "";
-    updateLastFeedbackButtons();
+function clearCelebration() {
+  state.celebratedGameId = null;
+  document.querySelectorAll(".confetti-layer").forEach((layer) => layer.remove());
+  const banner = document.getElementById("win-banner");
+  banner.classList.add("hidden");
+  banner.classList.remove("show");
+  banner.textContent = "";
+}
+
+function celebrateWin() {
+  if (!state.gameId || state.celebratedGameId === state.gameId) {
     return;
   }
+  state.celebratedGameId = state.gameId;
+  const gameId = state.gameId;
 
-  lastPanel.classList.remove("hidden");
-  lastText.textContent = `${state.lastFeedback.chosenAction.description}. Draget är redan sparat som träningsdata.`;
-  updateLastFeedbackButtons();
-}
+  const banner = document.getElementById("win-banner");
+  banner.textContent = WIN_MESSAGES[Math.floor(Math.random() * WIN_MESSAGES.length)];
+  banner.classList.remove("hidden");
+  // Restart the pop animation even if the banner was just shown.
+  banner.classList.remove("show");
+  void banner.offsetWidth;
+  banner.classList.add("show");
 
-function updateLastFeedbackButtons() {
-  const strength = state.lastFeedbackStrength || "normal";
-  const mapping = {
-    normal: "last-normal",
-    important: "last-important",
-    key_move: "last-key",
-  };
-  Object.values(mapping).forEach((id) => {
-    document.getElementById(id).classList.remove("active");
-    document.getElementById(id).setAttribute("aria-pressed", "false");
-  });
-  const activeId = mapping[strength];
-  if (activeId) {
-    document.getElementById(activeId).classList.add("active");
-    document.getElementById(activeId).setAttribute("aria-pressed", "true");
-  }
-}
-
-function updateCaptureButtons() {
-  const mapping = {
-    normal: "capture-normal",
-    important: "capture-important",
-    key_move: "capture-key",
-  };
-  Object.values(mapping).forEach((id) => {
-    document.getElementById(id).classList.remove("active");
-    document.getElementById(id).setAttribute("aria-pressed", "false");
-  });
-  const activeId = mapping[state.captureStrength || "normal"];
-  if (activeId) {
-    document.getElementById(activeId).classList.add("active");
-    document.getElementById(activeId).setAttribute("aria-pressed", "true");
-  }
-}
-
-function setCaptureStrength(strength) {
-  state.captureStrength = strength;
-  storeCaptureStrength(strength);
-  updateCaptureButtons();
+  // Let the finished board land before the confetti starts.
+  window.setTimeout(() => {
+    if (state.gameId !== gameId) {
+      return;
+    }
+    const glyphs = ["♥", "♦", "♣", "♠"];
+    const colors = ["#b03131", "#d17a00", "#116466", "#284b8f"];
+    const rise = Math.random() < 0.35;
+    const layer = document.createElement("div");
+    layer.className = `confetti-layer${rise ? " rise" : ""}`;
+    const pieces = 60 + Math.floor(Math.random() * 50);
+    let longest = 0;
+    for (let i = 0; i < pieces; i += 1) {
+      const piece = document.createElement("span");
+      piece.className = "confetti-piece";
+      const duration = 3.2 + Math.random() * 3.4;
+      const delay = Math.random() * 1.6;
+      longest = Math.max(longest, duration + delay);
+      piece.style.left = `${Math.random() * 100}%`;
+      piece.style.animationDuration = `${duration}s`;
+      piece.style.animationDelay = `${delay}s`;
+      const inner = document.createElement("span");
+      inner.className = "confetti-inner";
+      inner.style.animationDuration = `${0.9 + Math.random() * 1.4}s`;
+      inner.style.fontSize = `${0.9 + Math.random() * 1.5}rem`;
+      inner.style.color = colors[Math.floor(Math.random() * colors.length)];
+      inner.textContent = glyphs[Math.floor(Math.random() * glyphs.length)];
+      piece.appendChild(inner);
+      layer.appendChild(piece);
+    }
+    document.body.appendChild(layer);
+    window.setTimeout(() => layer.remove(), (longest + 0.5) * 1000);
+  }, 550);
 }
 
 function updateLostBanner() {
@@ -454,6 +414,116 @@ function updateLostBanner() {
   if (locked) {
     banner.textContent =
       "Partiet är kört. Varje kolumn har ett dött kort, så inget hål kan skapas igen – ge upp och blanda om.";
+  }
+}
+
+function clearAdvice() {
+  state.advice = null;
+  state.adviceLoading = false;
+  document.getElementById("advice-panel").classList.add("hidden");
+  document.getElementById("advice-line").classList.add("hidden");
+}
+
+function renderAdvice(payload) {
+  state.advice = payload;
+  const panel = document.getElementById("advice-panel");
+  const title = document.getElementById("advice-title");
+  const message = document.getElementById("advice-message");
+  const lineList = document.getElementById("advice-line");
+  const actionsRow = document.getElementById("advice-actions");
+  const playButton = document.getElementById("advice-play");
+  panel.classList.remove("hidden");
+
+  const titles = {
+    won: "Partiet är vunnet",
+    endgame_true: "Vinst finns – bevisad vinstlinje",
+    endgame_none: "Ingen vinst hittad (ej bevisat förlorad)",
+    stuck: "Bevisligt förlorat",
+    midgame: "Rekommenderat drag",
+    over: "Partiet är avslutat",
+  };
+  let titleKey = payload.mode;
+  if (payload.mode === "endgame") {
+    titleKey = payload.can_win === true ? "endgame_true" : "endgame_none";
+  }
+  title.textContent = titles[titleKey] || payload.mode;
+  message.textContent = `${payload.message}${payload.elapsed_s !== undefined ? ` (${payload.elapsed_s}s)` : ""}`;
+
+  const line = payload.win_line || [];
+  if (line.length) {
+    lineList.classList.remove("hidden");
+    lineList.innerHTML = line
+      .map(
+        (move, index) =>
+          `<li class="advice-step"><span class="advice-step-number">${index + 1}</span> ${move.description}</li>`
+      )
+      .join("");
+  } else {
+    lineList.classList.add("hidden");
+    lineList.innerHTML = "";
+  }
+
+  const action = payload.recommended_action;
+  if (action) {
+    actionsRow.classList.remove("hidden");
+    playButton.textContent =
+      action.type === "deal" ? action.description : `Spela ${action.description}`;
+    playButton.onclick = async () => {
+      if (!state.advice || !state.advice.recommended_action) {
+        return;
+      }
+      const a = state.advice.recommended_action;
+      if (a.type === "deal") {
+        await performDeal();
+      } else {
+        await performMove(a.from_column, a.to_column, a.run_length);
+      }
+    };
+  } else {
+    actionsRow.classList.add("hidden");
+    playButton.onclick = null;
+  }
+}
+
+async function requestAdvice() {
+  if (!state.gameId || !state.snapshot || state.snapshot.status !== "in_progress") {
+    return;
+  }
+  if (state.adviceLoading) {
+    return;
+  }
+  const button = document.getElementById("solve-advice");
+  const requestedHash = state.snapshot.state_hash;
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), ADVICE_REQUEST_TIMEOUT_MS);
+  state.adviceLoading = true;
+  button.disabled = true;
+  button.textContent = "Analyserar…";
+  try {
+    const payload = await api("/ai/solve-advice", {
+      method: "POST",
+      body: JSON.stringify({ game_id: state.gameId }),
+      signal: controller.signal,
+    });
+    if (!state.snapshot || state.snapshot.state_hash !== requestedHash) {
+      return; // position changed while analysing; discard stale advice
+    }
+    renderAdvice(payload);
+  } catch (error) {
+    if (state.snapshot && state.snapshot.state_hash === requestedHash) {
+      renderAdvice({
+        mode: "error",
+        message: error.name === "AbortError" ? "Analysen tog för lång tid. Prova igen." : `Analysen misslyckades: ${error.message}`,
+        can_win: null,
+        win_line: [],
+        recommended_action: null,
+      });
+    }
+  } finally {
+    window.clearTimeout(timeoutId);
+    state.adviceLoading = false;
+    button.disabled = false;
+    button.textContent = "Slutspelsanalys";
   }
 }
 
@@ -469,7 +539,6 @@ function updateStatus() {
     ? `Vald sekvens: kolumn ${selection.fromColumn + 1}, längd ${selection.runLength}. Klicka eller släpp på målkolumn.`
     : "Ingen flytt vald.";
   updateFeedbackPanel();
-  updateCaptureButtons();
 }
 
 function renderSuggestions() {
@@ -482,33 +551,14 @@ function renderSuggestions() {
   container.className = "suggestions";
   container.innerHTML = state.suggestions
     .map((suggestion) => {
-      let sourceBadge = state.aiContext && state.aiContext.modelEligible ? "modell" : "search";
-      if (state.aiContext && state.aiContext.holeModelActive) {
-        sourceBadge += "+hål";
-      }
-      if (state.aiContext && state.aiContext.compactModelActive) {
-        sourceBadge += "+kompakt";
-      }
-      const searchPart =
-        suggestion.search_score === null || suggestion.search_score === undefined
-          ? ""
-          : ` | search ${suggestion.search_score.toFixed(1)}`;
-      const modelPart =
-        suggestion.model_score === null || suggestion.model_score === undefined
-          ? ""
-          : ` | modell ${suggestion.model_score.toFixed(3)}`;
-      const holePart =
-        suggestion.hole_model_score === null || suggestion.hole_model_score === undefined
-          ? ""
-          : ` | hål ${suggestion.hole_model_score.toFixed(3)}`;
-      const compactPart =
-        suggestion.compact_model_score === null || suggestion.compact_model_score === undefined
-          ? ""
-          : ` | kompakt ${suggestion.compact_model_score.toFixed(3)}`;
-      const lockPart = suggestion.locks_position ? ` | <span class="locks-position">låser partiet</span>` : "";
-      return `<button class="suggestion-item${suggestion.locks_position ? " locks" : ""}" data-type="${suggestion.type}" data-from="${suggestion.from_column ?? ""}" data-to="${suggestion.to_column ?? ""}" data-run="${suggestion.run_length ?? ""}">
+      const sourceBadgeMap = {
+        solver: "sökare",
+        "solver+vinstlinje": "vinstlinje",
+      };
+      const sourceBadge = sourceBadgeMap[rankingSource()] || "sökare";
+      return `<button class="suggestion-item" data-type="${suggestion.type}" data-from="${suggestion.from_column ?? ""}" data-to="${suggestion.to_column ?? ""}" data-run="${suggestion.run_length ?? ""}">
         <span class="suggestion-main">${suggestion.description}</span>
-        <span class="suggestion-meta">${sourceBadge} | heuristik ${suggestion.heuristic_score.toFixed(1)}${searchPart}${modelPart}${holePart}${compactPart}${lockPart}</span>
+        <span class="suggestion-meta">${sourceBadge} | heuristik ${suggestion.heuristic_score.toFixed(1)}</span>
       </button>`;
     })
     .join("");
@@ -736,9 +786,15 @@ function applySnapshot(snapshot) {
   state.selection = null;
   state.selectionTarget = null;
   state.hoveredSuggestion = null;
+  clearAdvice();
   storeActiveGameId(snapshot.game_id);
   syncUrlGameId(snapshot.game_id);
   render();
+  if (snapshot.status === "won") {
+    celebrateWin();
+  } else {
+    state.celebratedGameId = null;
+  }
   refreshReachable();
   if (autoAiEnabled() && snapshot.status === "in_progress") {
     loadSuggestions({ silentIfCurrent: true }).catch((error) => {
@@ -750,6 +806,7 @@ function applySnapshot(snapshot) {
 
 async function startNewGame() {
   cancelPendingAiRequest();
+  clearCelebration();
   const snapshot = await api("/game/new", {
     method: "POST",
     body: JSON.stringify({}),
@@ -758,9 +815,6 @@ async function startNewGame() {
   state.aiContext = null;
   state.feedbackStatus = "";
   state.savedFeedbackKeys = new Set();
-  state.lastFeedback = null;
-  state.lastFeedbackStrength = null;
-  state.captureStrength = readStoredCaptureStrength();
   applySnapshot(snapshot);
 }
 
@@ -775,9 +829,6 @@ async function restoreStoredGame() {
     state.suggestions = [];
     state.aiContext = null;
     state.feedbackStatus = "Tidigare parti ateranslutet.";
-    state.lastFeedback = null;
-    state.lastFeedbackStrength = null;
-    state.captureStrength = readStoredCaptureStrength();
     applySnapshot(snapshot);
     return true;
   } catch (error) {
@@ -816,32 +867,6 @@ async function saveCorrection(entry, { strength = "normal", appliesTo = "last_mo
   state.feedbackStatus = `${FEEDBACK_LABELS[strength] || strength} sparad i ${payload.path}`;
 }
 
-async function saveCurrentPlannedFeedback(strength) {
-  const candidate = currentPlannedFeedbackEntry();
-  if (!candidate) {
-    return;
-  }
-  await saveCorrection(candidate, {
-    strength,
-    appliesTo: "planned_move",
-    note: "planned human correction",
-  });
-  updateFeedbackPanel();
-}
-
-async function saveLastMoveFeedback(strength) {
-  if (!state.lastFeedback) {
-    return;
-  }
-  await saveCorrection(state.lastFeedback, {
-    strength,
-    appliesTo: "last_move",
-    note: "post-move human correction",
-  });
-  state.lastFeedbackStrength = strength;
-  updateFeedbackPanel();
-}
-
 async function performMove(fromColumn, toColumn, runLength) {
   if (state.snapshot.status !== "in_progress") {
     return;
@@ -858,11 +883,9 @@ async function performMove(fromColumn, toColumn, runLength) {
   });
   state.suggestions = [];
   state.aiContext = null;
-  state.lastFeedback = latestFeedback;
-  state.lastFeedbackStrength = state.captureStrength;
   applySnapshot(snapshot);
   saveCorrection(latestFeedback, {
-    strength: state.captureStrength,
+    strength: "normal",
     appliesTo: "last_move",
     note: "auto-saved human move",
   }).catch((error) => {
@@ -879,11 +902,9 @@ async function performDeal() {
   });
   state.suggestions = [];
   state.aiContext = null;
-  state.lastFeedback = latestFeedback;
-  state.lastFeedbackStrength = state.captureStrength;
   applySnapshot(snapshot);
   saveCorrection(latestFeedback, {
-    strength: state.captureStrength,
+    strength: "normal",
     appliesTo: "last_move",
     note: "auto-saved human deal",
   }).catch((error) => {
@@ -899,8 +920,6 @@ async function performUndo() {
   });
   state.suggestions = [];
   state.aiContext = null;
-  state.lastFeedback = null;
-  state.lastFeedbackStrength = null;
   applySnapshot(snapshot);
 }
 
@@ -911,8 +930,6 @@ async function performConcede() {
   });
   state.suggestions = [];
   state.aiContext = null;
-  state.lastFeedback = null;
-  state.lastFeedbackStrength = null;
   applySnapshot(snapshot);
 }
 
@@ -951,10 +968,6 @@ async function loadSuggestions({ silentIfCurrent = false } = {}) {
       suggestions: payload.suggestions,
       modelLoaded: payload.model_loaded,
       modelEligible: payload.model_eligible,
-      holeModelLoaded: payload.hole_model_loaded,
-      holeModelActive: payload.hole_model_active,
-      compactModelLoaded: payload.compact_model_loaded,
-      compactModelActive: payload.compact_model_active,
       rankingSource: payload.ranking_source,
     };
     state.feedbackStatus = "";
@@ -997,6 +1010,7 @@ document.getElementById("new-game").addEventListener("click", startNewGame);
 document.getElementById("deal").addEventListener("click", performDeal);
 document.getElementById("undo").addEventListener("click", performUndo);
 document.getElementById("suggest").addEventListener("click", () => loadSuggestions());
+document.getElementById("solve-advice").addEventListener("click", requestAdvice);
 document.getElementById("concede").addEventListener("click", performConcede);
 document.getElementById("auto-ai").addEventListener("change", handleAutoAiToggle);
 
@@ -1019,19 +1033,8 @@ function bindMarkingToggle(elementId, storageKey, stateKey, onChange) {
 bindMarkingToggle("mark-dead", MARK_DEAD_STORAGE_KEY, "markDead");
 bindMarkingToggle("mark-movable", MARK_MOVABLE_STORAGE_KEY, "markMovable");
 bindMarkingToggle("mark-reachable", MARK_REACHABLE_STORAGE_KEY, "markReachable", refreshReachable);
-document.getElementById("pending-normal").addEventListener("click", () => saveCurrentPlannedFeedback("normal"));
-document.getElementById("pending-important").addEventListener("click", () => saveCurrentPlannedFeedback("important"));
-document.getElementById("pending-key").addEventListener("click", () => saveCurrentPlannedFeedback("key_move"));
-document.getElementById("last-normal").addEventListener("click", () => saveLastMoveFeedback("normal"));
-document.getElementById("last-important").addEventListener("click", () => saveLastMoveFeedback("important"));
-document.getElementById("last-key").addEventListener("click", () => saveLastMoveFeedback("key_move"));
-document.getElementById("capture-normal").addEventListener("click", () => setCaptureStrength("normal"));
-document.getElementById("capture-important").addEventListener("click", () => setCaptureStrength("important"));
-document.getElementById("capture-key").addEventListener("click", () => setCaptureStrength("key_move"));
 
 document.getElementById("status-text").textContent = "Laddar parti...";
-state.captureStrength = readStoredCaptureStrength();
-updateCaptureButtons();
 
 restoreStoredGame().then((restored) => {
   if (restored) {

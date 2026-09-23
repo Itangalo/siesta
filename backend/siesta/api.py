@@ -4,8 +4,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 import json
+import random as _random
 import threading
+import time as _time
 import uuid
+from collections import Counter
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -32,7 +35,25 @@ from .deadlock import (
     is_provably_lost,
 )
 from .reachability import DEFAULT_MAX_DEPTH, cards_movable_within
-from .training import rank_actions_for_state, train_policy_model
+from .training import train_policy_model
+from .fastgame import (
+    RANK as FAST_RANK,
+    apply_move as fast_apply_move,
+    card_code,
+    dead_columns as fast_dead_columns,
+    game_state_to_fast,
+    is_won as fast_is_won,
+)
+from .solver import (
+    TableauScorer,
+    choose_handoff_target,
+    choose_segment_target,
+    solve_endgame,
+    path_to as fast_path_to,
+    sample_stock_orders,
+    segment_search as fast_segment_search,
+    segment_search_beam,
+)
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -160,6 +181,12 @@ class FeedbackRequest(BaseModel):
     candidate_actions: List[Dict[str, Any]] = Field(default_factory=list)
     state_snapshot: Dict[str, Any]
     note: Optional[str] = None
+
+
+class SolveAdviceRequest(BaseModel):
+    game_id: str
+    budget_s: float = Field(default=15.0, ge=1.0, le=120.0)
+    midgame_nodes: int = Field(default=150000, ge=10000, le=1000000)
 
 
 store = SessionStore()
@@ -426,8 +453,249 @@ def get_reachable_moves(game_id: str, depth: int = DEFAULT_MAX_DEPTH) -> Dict[st
 @app.post("/ai/evaluate-move")
 def evaluate_move(request: GameActionRequest) -> Dict[str, Any]:
     session = _get_session(request.game_id)
-    ranking = rank_actions_for_state(session.state)
-    return {"game_id": request.game_id, **ranking}
+    return {"game_id": request.game_id, **_solver_ranking(session.state)}
+
+
+SOLVER_MIDGAME_NODES = 60000
+SOLVER_ENDGAME_BUDGET_S = 2.0
+
+
+def _solver_ranking(state: GameState) -> Dict[str, Any]:
+    """Search-engine move suggestions for the UI.
+
+    Endgame: hunt for a proven winning line; if one exists its first moves are
+    served as ordered, playable suggestions. Mid-game: steer toward the best
+    tableau reachable before the next deal and serve the first plan steps.
+    Only visible cards and the multiset of unseen ranks are ever used.
+    """
+    import time as _time
+
+    started = _time.time()
+    scorer = TableauScorer()
+    cols, stock = game_state_to_fast(state.columns, state.stock)
+
+    def finish(suggestions: List[Dict[str, Any]], source: str) -> Dict[str, Any]:
+        return {
+            "suggestions": suggestions,
+            "model_loaded": False,
+            "model_eligible": False,
+            "hole_model_loaded": False,
+            "hole_model_active": False,
+            "compact_model_loaded": False,
+            "compact_model_active": False,
+            "ranking_source": source,
+        }
+
+    base_score = scorer.score(cols, deal_size=min(7, len(stock)))
+
+    def move_suggestion(cols_before, move, label_prefix: str) -> Dict[str, Any]:
+        action = _fast_move_action(cols_before, move)
+        child = _apply_fast_move(cols_before, move)
+        action["heuristic_score"] = round(
+            scorer.score(child, deal_size=0) - scorer.score(cols_before, deal_size=0), 1
+        )
+        if label_prefix:
+            action["description"] = f"{label_prefix} {action['description']}"
+        return action
+
+    if not stock:
+        remaining = SOLVER_ENDGAME_BUDGET_S - (_time.time() - started)
+        path = solve_endgame(cols, time_budget=max(0.5, remaining))
+        if path:
+            suggestions = []
+            cursor = cols
+            for index, move in enumerate(path[:6], start=1):
+                suggestions.append(
+                    move_suggestion(
+                        cursor,
+                        move,
+                        f"Vinstlinje {index}/{len(path)}:",
+                    )
+                )
+                cursor = _apply_fast_move(cursor, move)
+            return finish(suggestions, "solver+vinstlinje")
+
+    seen, mobility_map = fast_segment_search(
+        cols,
+        budget=SOLVER_MIDGAME_NODES if stock else max(20000, SOLVER_MIDGAME_NODES // 3),
+        max_depth=18,
+    )
+    deal_size = min(7, len(stock))
+    rng = _random.Random(state.moves_played)
+    samples = sample_stock_orders(stock, deal_size, 10, rng) if stock else None
+    target, _score = choose_segment_target(
+        seen,
+        scorer,
+        deal_size=deal_size,
+        stock_rank_counts=dict(Counter(FAST_RANK[cid] for cid in stock)),
+        lock_penalty=40.0,
+        stock_sample=samples,
+        w_post_deal_mobility=6.0,
+    )
+
+    if target is not None and target != cols:
+        path = fast_path_to(seen, target)
+        suggestions = []
+        cursor = cols
+        for index, move in enumerate(path[:6], start=1):
+            suggestions.append(move_suggestion(cursor, move, f"Plan {index}/{len(path)}:"))
+            cursor = _apply_fast_move(cursor, move)
+        return finish(suggestions, "solver")
+
+    if can_deal(state):
+        return finish(
+            [{
+                "type": "deal",
+                "description": f"Dela kort ({len(state.stock)} kvar)",
+                "heuristic_score": 0.0,
+            }],
+            "solver",
+        )
+    return finish([], "solver")
+
+
+def _fast_move_action(cols, move) -> Dict[str, Any]:
+    """Describe one fast-engine move in the UI's action format."""
+    from_column, to_column, run_length = move
+    moving = cols[from_column][len(cols[from_column]) - run_length :]
+    codes = "-".join(card_code(card) for card in moving)
+    if cols[to_column]:
+        description = f"{codes} -> {card_code(cols[to_column][-1])} (kol {to_column + 1})"
+    else:
+        description = f"{codes} -> tomt kol {to_column + 1}"
+    return {
+        "type": "move",
+        "from_column": from_column,
+        "to_column": to_column,
+        "run_length": run_length,
+        "description": description,
+    }
+
+
+def _apply_fast_move(cols, move):
+    new_cols = list(cols)
+    source = cols[move[0]]
+    moved = source[len(source) - move[2] :]
+    new_cols[move[0]] = source[: len(source) - move[2]]
+    new_cols[move[1]] = cols[move[1]] + moved
+    return tuple(new_cols)
+
+
+@app.post("/ai/solve-advice")
+def solve_advice(request: SolveAdviceRequest) -> Dict[str, Any]:
+    """Search-based advice for the current position.
+
+    Endgame (stock empty): runs the bidirectional solver for `budget_s`
+    seconds. A found line is a *proven* win; failure to find one is not proof
+    of loss unless the deadlock analysis says so.
+
+    Mid-game: steers toward the best tableau reachable before the next deal
+    and recommends its first move. Uses only visible cards plus the multiset
+    of unseen ranks - never the stock order.
+    """
+    started = _time.time()
+    session = _get_session(request.game_id)
+    state = session.state
+    base = {
+        "game_id": request.game_id,
+        "state_hash": state.state_hash,
+        "stock_count": len(state.stock),
+    }
+    if state.status == "won" or fast_is_won(game_state_to_fast(state.columns, [])[0]):
+        return {**base, "mode": "won", "can_win": True, "win_line": [],
+                "recommended_action": None, "message": "Partiet är redan vunnet."}
+    if state.status != "in_progress":
+        return {**base, "mode": "over", "can_win": False, "win_line": [],
+                "recommended_action": None, "message": "Partiet är avslutat."}
+
+    cols, stock = game_state_to_fast(state.columns, state.stock)
+
+    if not stock:
+        empty_rank_counts = {rank: 0 for rank in range(1, 14)}
+        if all(fast_dead_columns(cols, empty_rank_counts)):
+            return {**base, "mode": "stuck", "can_win": False, "win_line": [],
+                    "recommended_action": None,
+                    "elapsed_s": round(_time.time() - started, 2),
+                    "message": "Bevisligt förlorat: varje kolumn har ett dött kort och inget hål kan skapas."}
+        path = solve_endgame(cols, time_budget=request.budget_s)
+        elapsed = round(_time.time() - started, 2)
+        if path is not None:
+            actions = []
+            cursor = cols
+            for move in path:
+                actions.append(_fast_move_action(cursor, move))
+                cursor = _apply_fast_move(cursor, move)
+            return {**base, "mode": "endgame", "can_win": True, "win_line": actions,
+                    "recommended_action": actions[0] if actions else None,
+                    "line_length": len(actions),
+                    "elapsed_s": elapsed,
+                    "message": f"Vinst finns! Bevisad vinstlinje på {len(actions)} drag. Spela exakt dessa drag."}
+        return {**base, "mode": "endgame", "can_win": None, "win_line": [],
+                "recommended_action": None, "elapsed_s": elapsed,
+                "message": f"Ingen vinstlinje hittades inom {request.budget_s:.0f}s – positionen kan vara förlorad, men det är inte bevisat. Försök igen med längre budget vid behov."}
+
+    # Mid-game: best reachable tableau before the next deal, searched with
+    # the same beam + handoff machinery as full-game play: beam extends the
+    # node budget far deeper than breadth-first search, and the final segment
+    # (this deal empties the stock) is ranked by predicted endgame
+    # winnability with survival weighting, not raw tableau score.
+    scorer = TableauScorer()
+    stock_rank_counts = dict(Counter(FAST_RANK[cid] for cid in stock))
+    seen, _mobility_map = segment_search_beam(
+        cols,
+        scorer,
+        budget=request.midgame_nodes,
+        bfs_depth=6,
+        max_depth=40,
+        beam_width=2500,
+        stock_rank_counts=stock_rank_counts,
+        lock_penalty=40.0,
+    )
+    deal_size = min(7, len(stock))
+    target = None
+    if len(stock) <= 7:
+        target = choose_handoff_target(
+            seen,
+            scorer,
+            stock,
+            deal_size=deal_size,
+            lock_penalty=40.0,
+            samples=14,
+            seed_base=state.moves_played * 131 + (24 - len(stock)) // 7,
+            survive_weight=3.0,
+        )
+    if target is None:
+        rng = _random.Random(state.moves_played)
+        samples = sample_stock_orders(stock, deal_size, 10, rng)
+        target, _score = choose_segment_target(
+            seen,
+            scorer,
+            deal_size=deal_size,
+            stock_rank_counts=stock_rank_counts,
+            lock_penalty=40.0,
+            stock_sample=samples,
+            w_post_deal_mobility=6.0,
+        )
+    elapsed = round(_time.time() - started, 2)
+    if target is not None and target != cols:
+        path = fast_path_to(seen, target)
+        first = _fast_move_action(cols, path[0])
+        message = (
+            f"Rekommenderat drag: {first['description']} "
+            f"(första steget mot bästa nåbara tablå, {len(path)} drag framåt)."
+        )
+        return {**base, "mode": "midgame", "can_win": None, "win_line": [],
+                "recommended_action": first, "plan_length": len(path),
+                "elapsed_s": elapsed, "message": message}
+    if can_deal(state):
+        action = {"type": "deal",
+                  "description": f"Dela kort ({len(state.stock)} kvar i talongen)"}
+        return {**base, "mode": "midgame", "can_win": None, "win_line": [],
+                "recommended_action": action, "elapsed_s": elapsed,
+                "message": "Inga förbättrande drag hittade – dela nästa kort."}
+    return {**base, "mode": "stuck", "can_win": None, "win_line": [],
+            "recommended_action": None, "elapsed_s": elapsed,
+            "message": "Inga lagliga drag och talongen är tom."}
 
 
 @app.post("/ai/feedback")
