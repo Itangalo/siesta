@@ -49,6 +49,7 @@ from .solver import (
     choose_handoff_target,
     choose_segment_target,
     solve_endgame,
+    solve_endgame_status,
     path_to as fast_path_to,
     sample_stock_orders,
     segment_search as fast_segment_search,
@@ -585,9 +586,9 @@ def _apply_fast_move(cols, move):
 def solve_advice(request: SolveAdviceRequest) -> Dict[str, Any]:
     """Search-based advice for the current position.
 
-    Endgame (stock empty): runs the bidirectional solver for `budget_s`
-    seconds. A found line is a *proven* win; failure to find one is not proof
-    of loss unless the deadlock analysis says so.
+    Endgame (stock empty): runs the A* endgame solver for `budget_s` seconds.
+    A found line is a *proven* win; an exhausted search is a proven loss;
+    running out of time proves nothing.
 
     Mid-game: steers toward the best tableau reachable before the next deal
     and recommends its first move. Uses only visible cards plus the multiset
@@ -617,8 +618,12 @@ def solve_advice(request: SolveAdviceRequest) -> Dict[str, Any]:
                     "recommended_action": None,
                     "elapsed_s": round(_time.time() - started, 2),
                     "message": "Bevisligt förlorat: varje kolumn har ett dött kort och inget hål kan skapas."}
-        path = solve_endgame(cols, time_budget=request.budget_s)
+        path, proven_lost = solve_endgame_status(cols, time_budget=request.budget_s)
         elapsed = round(_time.time() - started, 2)
+        if proven_lost:
+            return {**base, "mode": "stuck", "can_win": False, "win_line": [],
+                    "recommended_action": None, "elapsed_s": elapsed,
+                    "message": "Bevisligt förlorat: sökningen har gått igenom alla nåbara ställningar utan att hitta en vinst."}
         if path is not None:
             actions = []
             cursor = cols
