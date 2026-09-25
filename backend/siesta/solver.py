@@ -60,8 +60,20 @@ class TableauScorer:
         burial_decay: float = 0.82,
         w_stranded: float = -14.0,
         w_max_chain: float = 0.0,
+        w_buried_pairs: float = 0.0,
+        w_near_hole_1: float = 0.0,
+        w_near_hole_2: float = 0.0,
+        w_king_ladder: float = 0.0,
+        w_full_ladder: float = 0.0,
+        ladder_safe_burial: bool = False,
+        w_ladder_extra_suits: float = 0.0,
+        w_ladder_suit_match: float = 0.0,
+        w_hole_right: float = 0.0,
+        w_ladder_left: float = 0.0,
     ) -> None:
         self._col_cache: Dict[Tuple[int, ...], Tuple[float, int, int]] = {}
+        self._shape_cache: Dict[Tuple[int, ...], Tuple[float, int]] = {}
+        self._ladder_suits_cache: Dict[Tuple[int, ...], Tuple[int, ...]] = {}
         self._top_run_cache: Dict[Tuple[int, ...], int] = {}
         self._completed_cache: Dict[Tuple[int, ...], int] = {}
         self._maxchain_cache: Dict[Tableau, Tuple[int, int, int, int]] = {}
@@ -76,6 +88,16 @@ class TableauScorer:
         self.burial_decay = burial_decay
         self.w_stranded = w_stranded
         self.w_max_chain = w_max_chain
+        self.w_buried_pairs = w_buried_pairs
+        self.w_near_hole_1 = w_near_hole_1
+        self.w_near_hole_2 = w_near_hole_2
+        self.w_king_ladder = w_king_ladder
+        self.w_full_ladder = w_full_ladder
+        self.ladder_safe_burial = ladder_safe_burial
+        self.w_ladder_extra_suits = w_ladder_extra_suits
+        self.w_ladder_suit_match = w_ladder_suit_match
+        self.w_hole_right = w_hole_right
+        self.w_ladder_left = w_ladder_left
 
     def max_chains(self, cols: Tableau) -> Tuple[int, int, int, int]:
         cached = self._maxchain_cache.get(cols)
@@ -127,6 +149,100 @@ class TableauScorer:
         self._col_cache[col] = feats
         return feats
 
+    def column_shape(self, col: Tuple[int, ...]) -> Tuple[float, int]:
+        """(buried pairs, segment count) for a column.
+
+        Segments are maximal same-suit runs, the units cards move in. Every
+        segment below the top one is buried. Buried segments based on a king
+        are harmless (they only need a hole); those ending in an ace, or based
+        on a 2 or a queen, matter less than mid-rank ones. Several buried
+        segments in one column compound: freeing one still leaves the others
+        stuck, so the pressure counts (weighted) pairs.
+
+        With ``ladder_safe_burial``, ladders (descending ranks, any suit) are
+        judged as a whole: segments in a king ladder at the column bottom are
+        not buried at all, and those in a ladder ending in an ace count 0.3.
+        """
+        cached = self._shape_cache.get(col)
+        if cached is not None:
+            return cached
+        n = len(col)
+        king_len = self.king_ladder_length(col) if self.ladder_safe_burial else 0
+        in_ace_ladder = [False] * n
+        if self.ladder_safe_burial:
+            for a in range(king_len, n):
+                if RANK[col[a]] == 1:
+                    start = a
+                    while start > king_len and RANK[col[start - 1]] == RANK[col[start]] + 1:
+                        start -= 1
+                    for k in range(start, a + 1):
+                        in_ace_ladder[k] = True
+        segments = 0
+        pressure = 0.0
+        i = 0
+        while i < n:
+            j = i
+            while j + 1 < n and SUIT[col[j + 1]] == SUIT[col[j]] and RANK[col[j]] == RANK[col[j + 1]] + 1:
+                j += 1
+            segments += 1
+            if j < n - 1:  # buried under another segment
+                base, top = RANK[col[i]], RANK[col[j]]
+                if j < king_len:
+                    weight = 0.0
+                elif in_ace_ladder[i] and in_ace_ladder[j]:
+                    weight = 0.3
+                elif base == 13:
+                    weight = 0.0
+                elif top == 1:
+                    weight = 0.3
+                elif base in (2, 12):
+                    weight = 0.5
+                else:
+                    weight = 1.0
+                pressure += weight
+            i = j + 1
+        pairs = pressure * (pressure - 1.0) / 2.0 if pressure > 1.0 else 0.0
+        shape = (pairs, segments)
+        self._shape_cache[col] = shape
+        return shape
+
+    def king_ladder_length(self, col: Tuple[int, ...]) -> int:
+        """Length of the ladder (descending ranks, any suit) standing on a
+        king at the column bottom; 13 is a full K-A ladder. It holds exactly
+        one card of each rank, which leaves the rest easier to sort, and it
+        keeps that value when buried."""
+        n = len(col)
+        if not n or RANK[col[0]] != 13:
+            return 0
+        length = 1
+        while length < n and RANK[col[length]] == RANK[col[length - 1]] - 1:
+            length += 1
+        return length
+
+    def column_ladder_suits(self, col: Tuple[int, ...]) -> Tuple[int, ...]:
+        """Suit bitmasks of the mixed ladders (descending ranks, at least 3
+        cards, at least 2 suits) in a column. Mixed ladders of only two
+        suits, and pairs of ladders sharing the same two suits, are easier
+        to sort into suited runs later."""
+        cached = self._ladder_suits_cache.get(col)
+        if cached is not None:
+            return cached
+        masks: List[int] = []
+        n = len(col)
+        i = 0
+        while i < n:
+            j = i
+            mask = 1 << SUIT[col[i]]
+            while j + 1 < n and RANK[col[j]] == RANK[col[j + 1]] + 1:
+                j += 1
+                mask |= 1 << SUIT[col[j]]
+            if j - i + 1 >= 3 and mask & (mask - 1):
+                masks.append(mask)
+            i = j + 1
+        result = tuple(masks)
+        self._ladder_suits_cache[col] = result
+        return result
+
     def column_top_run(self, col: Tuple[int, ...]) -> int:
         cached = self._top_run_cache.get(col)
         if cached is not None:
@@ -166,16 +282,45 @@ class TableauScorer:
         completed_total = 0
         holes = 0
         tops: List[int] = []
-        for col in cols:
+        two_suit_masks: Dict[int, int] = {}
+        for ci, col in enumerate(cols):
             if not col:
                 holes += 1
+                # The 24-card stock deals 7+7+7+3: holes in columns 4-7
+                # survive the last deal.
+                if ci >= 3:
+                    value += self.w_hole_right
                 continue
+            if self.w_ladder_extra_suits or self.w_ladder_suit_match:
+                for mask in self.column_ladder_suits(col):
+                    suits = bin(mask).count("1")
+                    value -= self.w_ladder_extra_suits * (suits - 2)
+                    if suits == 2:
+                        two_suit_masks[mask] = two_suit_masks.get(mask, 0) + 1
             completed_total += self.column_completed(col)
             run_energy, king_run, ace_run = self.column_features(col)
             value += self.w_run_sq * run_energy
             value += self.w_king_run * king_run
             value += self.w_ace_run * ace_run
+            if self.w_king_ladder or self.w_full_ladder:
+                ladder = self.king_ladder_length(col)
+                value += self.w_king_ladder * ladder
+                if ladder == 13:
+                    value += self.w_full_ladder
+            if self.w_ladder_left and ci < 3 and self.king_ladder_length(col):
+                value += self.w_ladder_left  # fine to bury: columns 1-3 get the last deal
+            if self.w_buried_pairs or self.w_near_hole_1 or self.w_near_hole_2:
+                pairs, segments = self.column_shape(col)
+                value -= self.w_buried_pairs * pairs
+                # A deal always refills holes, so post-deal a hole survives
+                # only as a column one or two movable units from empty.
+                if segments == 1:
+                    value += self.w_near_hole_1
+                elif segments == 2:
+                    value += self.w_near_hole_2
             tops.append(RANK[col[-1]])
+        for count in two_suit_masks.values():
+            value += self.w_ladder_suit_match * (count * (count - 1) / 2)
         value += self.w_completed * completed_total
         if self.w_max_chain:
             chains = self.max_chains(cols)
@@ -205,6 +350,79 @@ class TableauScorer:
     def delta(self, cols: Tableau, move: MoveT, deal_size: int = 7) -> float:
         """Score change of applying ``move``; used for endgame move ordering."""
         return self.score(apply_move(cols, move), deal_size=deal_size) - self.score(cols, deal_size=deal_size)
+
+
+def _segments_on_top(col: Tuple[int, ...]) -> List[int]:
+    """Lengths of the same-suit segments forming the top ladder (descending
+    ranks, any suit), topmost segment first."""
+    lengths: List[int] = []
+    n = len(col)
+    i = n - 1
+    while i >= 0:
+        j = i
+        while j > 0 and SUIT[col[j - 1]] == SUIT[col[j]] and RANK[col[j - 1]] == RANK[col[j]] + 1:
+            j -= 1
+        lengths.append(i - j + 1)
+        if j == 0 or RANK[col[j - 1]] != RANK[col[j]] + 1:
+            break
+        i = j - 1
+    return lengths
+
+
+def super_moves(cols: Tableau) -> List[Tuple[List[MoveT], Tableau]]:
+    """Multi-segment ladder relocations through holes (Tower of Hanoi).
+
+    A mixed ladder of k same-suit segments can move as a unit onto a card
+    one rank above its base (or into a hole) when k <= 2**h, h being the
+    other free holes. Such rearrangements pass through positions that look
+    worse (suited runs parked in holes), so a score-pruned beam rarely
+    finds them move by move. Returns (move list, resulting tableau) pairs
+    for k >= 2 segments.
+    """
+    holes = [ci for ci in range(7) if not cols[ci]]
+    if not holes:
+        return []
+    out: List[Tuple[List[MoveT], Tableau]] = []
+    for frm in range(7):
+        col = cols[frm]
+        if not col:
+            continue
+        seg_lengths = _segments_on_top(col)
+        if len(seg_lengths) < 2:
+            continue
+        for k in range(2, len(seg_lengths) + 1):
+            cards = sum(seg_lengths[:k])
+            if cards == len(col):
+                continue  # whole column: relocating it only swaps columns
+            base_rank = RANK[col[-cards]]
+            for to in range(7):
+                if to == frm:
+                    continue
+                dest = cols[to]
+                if dest and RANK[dest[-1]] != base_rank + 1:
+                    continue
+                free = [h for h in holes if h != to]
+                if k > (1 << len(free)):
+                    continue
+                moves: List[MoveT] = []
+                state = [cols]
+
+                def move_segments(count: int, src: int, dst: int, spare: List[int], segs: List[int]) -> None:
+                    # segs: lengths of the ``count`` topmost segments on src, top first
+                    if count == 1:
+                        mv = (src, dst, segs[0])
+                        moves.append(mv)
+                        state[0] = apply_move(state[0], mv)
+                        return
+                    park, rest = spare[0], spare[1:]
+                    top = count // 2
+                    move_segments(top, src, park, rest, segs[:top])
+                    move_segments(count - top, src, dst, rest, segs[top:count])
+                    move_segments(top, park, dst, rest, segs[:top])
+
+                move_segments(k, frm, to, free, seg_lengths[:k])
+                out.append((moves, state[0]))
+    return out
 
 
 def segment_search(
@@ -516,6 +734,22 @@ class SolverConfig:
     w_hole_extra: float = 34.0
     w_run_sq: float = 3.0
     w_max_chain: float = 0.0
+    # Human-play heuristics, tuned on 192 deals and validated on 256 fresh
+    # ones: dig out columns with several buried segments, value near-holes
+    # (deals always refill holes), and build king ladders (K down to A, any
+    # suit), which stay useful when buried.
+    w_buried_pairs: float = 10.0
+    w_near_hole_1: float = 15.0
+    w_near_hole_2: float = 5.0
+    w_king_ladder: float = 6.0
+    w_full_ladder: float = 100.0
+    ladder_safe_burial: bool = True
+    # Measured neutral or slightly negative; kept as switches for experiments.
+    segment_supermoves: bool = False
+    w_ladder_extra_suits: float = 0.0
+    w_ladder_suit_match: float = 0.0
+    w_hole_right: float = 0.0
+    w_ladder_left: float = 0.0
     w_mobility: float = 0.0
     w_post_deal_mobility: float = 6.0
     # NOTE: w_winnability stays off — a model trained on FULL endgame states
@@ -539,6 +773,16 @@ class SolverConfig:
             w_hole_extra=self.w_hole_extra,
             w_run_sq=self.w_run_sq,
             w_max_chain=self.w_max_chain,
+            w_buried_pairs=self.w_buried_pairs,
+            w_near_hole_1=self.w_near_hole_1,
+            w_near_hole_2=self.w_near_hole_2,
+            w_king_ladder=self.w_king_ladder,
+            w_full_ladder=self.w_full_ladder,
+            ladder_safe_burial=self.ladder_safe_burial,
+            w_ladder_extra_suits=self.w_ladder_extra_suits,
+            w_ladder_suit_match=self.w_ladder_suit_match,
+            w_hole_right=self.w_hole_right,
+            w_ladder_left=self.w_ladder_left,
         )
 
 
@@ -605,6 +849,7 @@ def play_game(
                 beam_width=config.segment_beam_width,
                 stock_rank_counts=stock_rank_counts,
                 lock_penalty=config.lock_penalty,
+                supermoves=config.segment_supermoves,
             )
         else:
             seen, mobility_map = segment_search(cols, budget=config.segment_budget, max_depth=config.segment_depth)
@@ -1605,9 +1850,20 @@ def segment_search_beam(
     beam_width: int = 2500,
     stock_rank_counts: Optional[Dict[int, int]] = None,
     lock_penalty: float = 0.0,
+    supermoves: bool = False,
 ) -> Tuple[Dict[Tableau, Optional[Tuple[Tableau, MoveT]]], Dict[Tableau, int]]:
     """Exhaustive BFS for the first ``bfs_depth`` plies, then beam-extend the
-    most promising states much deeper. Endpoints are what matter, not paths."""
+    most promising states much deeper. Endpoints are what matter, not paths.
+    With ``supermoves``, Hanoi-style ladder relocations are extra edges
+    (stored as move lists; ``path_to`` expands them)."""
+
+    def expansions(cols: Tableau):
+        for move in legal_moves(cols):
+            yield move, apply_move(cols, move)
+        if supermoves:
+            for macro, child in super_moves(cols):
+                yield macro, child
+
     seen: Dict[Tableau, Optional[Tuple[Tableau, MoveT]]] = {start: None}
     mobility: Dict[Tableau, int] = {}
     frontier = [start]
@@ -1619,10 +1875,8 @@ def segment_search_beam(
             break
         nxt: List[Tableau] = []
         for cols in frontier:
-            moves = legal_moves(cols)
-            mobility[cols] = len(moves)
-            for move in moves:
-                child = apply_move(cols, move)
+            mobility[cols] = len(legal_moves(cols))
+            for move, child in expansions(cols):
                 if child not in seen:
                     seen[child] = (cols, move)
                     nxt.append(child)
@@ -1646,10 +1900,8 @@ def segment_search_beam(
             s0 = base_score.get(cols)
             if s0 is None:
                 s0 = scorer.score(cols, deal_size=7)
-            moves = legal_moves(cols)
-            mobility[cols] = len(moves)
-            for move in moves:
-                child = apply_move(cols, move)
+            mobility[cols] = len(legal_moves(cols))
+            for move, child in expansions(cols):
                 if child in seen:
                     continue
                 sc = scorer.score(child, deal_size=7)

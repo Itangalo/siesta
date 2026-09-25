@@ -45,7 +45,7 @@ from .fastgame import (
     is_won as fast_is_won,
 )
 from .solver import (
-    TableauScorer,
+    SolverConfig,
     choose_handoff_target,
     choose_segment_target,
     solve_endgame,
@@ -457,6 +457,9 @@ def evaluate_move(request: GameActionRequest) -> Dict[str, Any]:
     return {"game_id": request.game_id, **_solver_ranking(session.state)}
 
 
+# Same evaluation weights as full-game play, so GUI advice matches the
+# benchmarked engine.
+SOLVER_CONFIG = SolverConfig()
 SOLVER_MIDGAME_NODES = 60000
 SOLVER_ENDGAME_BUDGET_S = 2.0
 
@@ -472,7 +475,7 @@ def _solver_ranking(state: GameState) -> Dict[str, Any]:
     import time as _time
 
     started = _time.time()
-    scorer = TableauScorer()
+    scorer = SOLVER_CONFIG.make_scorer()
     cols, stock = game_state_to_fast(state.columns, state.stock)
 
     def finish(suggestions: List[Dict[str, Any]], source: str) -> Dict[str, Any]:
@@ -644,7 +647,7 @@ def solve_advice(request: SolveAdviceRequest) -> Dict[str, Any]:
     # node budget far deeper than breadth-first search, and the final segment
     # (this deal empties the stock) is ranked by predicted endgame
     # winnability with survival weighting, not raw tableau score.
-    scorer = TableauScorer()
+    scorer = SOLVER_CONFIG.make_scorer()
     stock_rank_counts = dict(Counter(FAST_RANK[cid] for cid in stock))
     seen, _mobility_map = segment_search_beam(
         cols,
@@ -655,6 +658,7 @@ def solve_advice(request: SolveAdviceRequest) -> Dict[str, Any]:
         beam_width=2500,
         stock_rank_counts=stock_rank_counts,
         lock_penalty=40.0,
+        supermoves=SOLVER_CONFIG.segment_supermoves,
     )
     deal_size = min(7, len(stock))
     target = None

@@ -224,15 +224,25 @@ def replay_moves(cols: Tableau, moves: Sequence[MoveT]) -> Tableau:
 
 
 def path_to(seen: Dict[Tableau, Optional[Tuple[Tableau, MoveT]]], target: Tableau) -> List[MoveT]:
-    """Reconstruct move sequence from start state (parent None) to target."""
-    moves: List[MoveT] = []
+    """Reconstruct move sequence from start state (parent None) to target.
+
+    An edge may be a single move or a list of moves (a macro such as a
+    super-move); macros are expanded in order.
+    """
+    edges: List[object] = []
     cur = target
     while True:
         entry = seen.get(cur)
         if entry is None:
             break
         parent, move = entry
-        moves.append(move)
+        edges.append(move)
         cur = parent
-    moves.reverse()
+    edges.reverse()
+    moves: List[MoveT] = []
+    for edge in edges:
+        if isinstance(edge, list):
+            moves.extend(edge)
+        else:
+            moves.append(edge)
     return moves
