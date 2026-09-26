@@ -26,6 +26,7 @@ from .game import (
     apply_deal,
     apply_move,
     can_deal,
+    compute_state_hash,
     create_game,
     legal_moves,
     serialize_state,
@@ -36,6 +37,7 @@ from .deadlock import (
 )
 from .reachability import DEFAULT_MAX_DEPTH, cards_movable_within
 from .training import train_policy_model
+from .winchance import estimate as estimate_win_chance
 from .fastgame import (
     RANK as FAST_RANK,
     apply_move as fast_apply_move,
@@ -449,6 +451,27 @@ def get_reachable_moves(game_id: str, depth: int = DEFAULT_MAX_DEPTH) -> Dict[st
         "depth": depth,
         "movable_within": cards_movable_within(session.state, max_depth=depth),
     }
+
+
+@app.get("/ai/win-chance")
+def get_win_chance(game_id: str) -> Dict[str, Any]:
+    """The engine's estimated chance of winning from the current position.
+
+    Mid-game an estimate (future deals are unknown); with the stock empty,
+    exact when the endgame solver settles it: proven win or proven loss.
+    Seeded by the state hash, so the same position always gets the same
+    number. Tagged with the state hash so the UI can drop late replies.
+    """
+    started = _time.time()
+    session = _get_session(game_id)
+    state = session.state
+    state_hash = state.state_hash or compute_state_hash(state)
+    base = {"game_id": game_id, "state_hash": state_hash}
+    if state.status not in ("in_progress", "won"):
+        return {**base, "mode": "over", "percent": None, "elapsed_s": 0.0}
+    cols, stock = game_state_to_fast(state.columns, state.stock)
+    report = estimate_win_chance(cols, stock, seed=int(state_hash, 16) % (2 ** 31))
+    return {**base, **report, "elapsed_s": round(_time.time() - started, 2)}
 
 
 @app.post("/ai/evaluate-move")

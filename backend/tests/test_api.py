@@ -272,3 +272,65 @@ def test_ai_suggestions_endgame_win_line():
     assert payload["ranking_source"] == "solver+vinstlinje"
     assert payload["suggestions"]
     assert payload["suggestions"][0]["description"].startswith("Vinstlinje ")
+
+
+def _session_with(columns, stock=()):
+    from backend.siesta.game import GameState
+
+    state = GameState(columns=[list(c) for c in columns], stock=list(stock), moves_played=40)
+    session = api_module.store.create(seed=96)
+    session.history = [state]
+    session.actions = []
+    return session
+
+
+def _suit_stack(suit, top=13, bottom=1):
+    from backend.siesta.game import Card
+
+    return [Card(rank=rank, suit=suit) for rank in range(top, bottom - 1, -1)]
+
+
+def test_win_chance_midgame_is_an_estimate():
+    game_id = client.post("/game/new", json={}).json()["game_id"]
+    data = client.get("/ai/win-chance", params={"game_id": game_id}).json()
+    assert data["mode"] == "estimate"
+    assert 0.0 <= data["percent"] <= 100.0
+    again = client.get("/ai/win-chance", params={"game_id": game_id}).json()
+    assert again["percent"] == data["percent"]  # seeded by the position
+
+
+def test_win_chance_endgame_proven_win():
+    clubs = _suit_stack("clubs")
+    session = _session_with([
+        _suit_stack("hearts"), _suit_stack("diamonds"), _suit_stack("spades"), clubs[:6], clubs[6:], [], [],
+    ])
+    data = client.get("/ai/win-chance", params={"game_id": session.game_id}).json()
+    assert data["mode"] == "proven_win"
+    assert data["percent"] == 100.0
+
+
+def test_win_chance_endgame_proven_loss():
+    from backend.siesta.fastgame import game_state_to_fast, legal_moves as fast_legal_moves
+    from backend.siesta.game import Card, create_deck
+
+    # Seven non-empty columns topped by the four kings and three fives, with
+    # no sixes on top: no legal move exists, so the game is lost.
+    tops = [Card(13, s) for s in ("hearts", "diamonds", "clubs", "spades")]
+    tops += [Card(5, s) for s in ("hearts", "diamonds", "clubs")]
+    rest = [card for card in create_deck() if card not in tops and card.rank != 6]
+    rest = [Card(6, s) for s in ("hearts", "diamonds", "clubs", "spades")] + rest
+    columns = [[] for _ in range(7)]
+    for index, card in enumerate(rest):
+        columns[index % 7].append(card)
+    for column, top in zip(columns, tops):
+        column.append(top)
+    cols, _ = game_state_to_fast(columns, [])
+    assert not fast_legal_moves(cols)
+    session = _session_with(columns)
+    data = client.get("/ai/win-chance", params={"game_id": session.game_id}).json()
+    assert data["mode"] == "proven_loss"
+    assert data["percent"] == 0.0
+
+
+def test_win_chance_unknown_game_is_404():
+    assert client.get("/ai/win-chance", params={"game_id": "does-not-exist"}).status_code == 404

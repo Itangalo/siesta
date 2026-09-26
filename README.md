@@ -39,5 +39,16 @@ python3 -m backend.siesta.cli benchmark --games 20
 - `GET /game/legal-moves`
 - `POST /ai/evaluate-move` – sökmotorn driver förslagen: plansteg mot bästa nåbara tablå i mellan spelet, bevisad vinstlinje i slutspelen
 - `POST /ai/solve-advice` – fördjupad slutspelsanalys på begäran: bevisad vinstlinje, "ej bevisat" eller "bevisligt förlorat"
+- `GET /ai/win-chance` – sökmotorns uppskattade vinstchans från aktuell ställning; i slutspelet bevisad vinst eller bevisligt förlorat när sökningen hinner avgöra
 - `POST /training/run`
 - `GET /training/status/{job_id}`
+
+## Vinstchansmodellen
+
+Vinstchansen bygger på en logistisk modell per spelfas, tränad på sökmotorns egna partier. Efter ändringar i motorn: spela nya partier och träna om, så skrivs `backend/siesta/winchance_weights.json` över.
+
+```bash
+python3 -m backend.siesta.winchance collect 2000 3000 states.pkl   # startseed, antal partier, fil
+python3 -m backend.siesta.winchance train states.pkl
+```
+

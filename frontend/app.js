@@ -78,6 +78,8 @@ const state = {
   advice: null,
   adviceLoading: false,
   celebratedGameId: null,
+  winChance: null,
+  winChanceLoading: false,
 };
 
 /**
@@ -114,6 +116,109 @@ async function refreshReachable() {
     setReachableError(error);
     renderBoard();
   }
+}
+
+/**
+ * Fetch the engine's win chance for the current position.
+ *
+ * Takes up to a few seconds mid-game, so the previous value stays on screen
+ * (dimmed) until the new one arrives, and a late reply for a position we have
+ * already left is dropped. The delta compares with the last value shown in
+ * the same game, which gives the eval-bar feel: did that move help?
+ */
+async function refreshWinChance() {
+  const snapshot = state.snapshot;
+  if (!snapshot || !state.gameId) {
+    return;
+  }
+  if (state.winChance && state.winChance.gameId !== state.gameId) {
+    state.winChance = null;
+  }
+  if (snapshot.status !== "in_progress" && snapshot.status !== "won") {
+    state.winChance = null;
+    state.winChanceLoading = false;
+    renderWinChance({ note: "Partiet är avslutat." });
+    return;
+  }
+  const requestedHash = snapshot.state_hash;
+  state.winChanceLoading = true;
+  renderWinChance();
+  try {
+    const result = await api(`/ai/win-chance?game_id=${encodeURIComponent(state.gameId)}`);
+    if (!state.snapshot || state.snapshot.state_hash !== requestedHash) {
+      return;
+    }
+    const previous = state.winChance;
+    state.winChance = {
+      gameId: state.gameId,
+      mode: result.mode,
+      percent: result.percent,
+      lineLength: result.line_length,
+      delta: previous && previous.percent !== null && result.percent !== null
+        ? result.percent - previous.percent
+        : null,
+    };
+    state.winChanceLoading = false;
+    renderWinChance();
+  } catch (error) {
+    if (!state.snapshot || state.snapshot.state_hash !== requestedHash) {
+      return;
+    }
+    state.winChanceLoading = false;
+    console.warn("[siesta] win-chance failed:", error);
+    renderWinChance({ note: "Kunde inte beräkna vinstchansen. Är servern omstartad efter senaste ändringen?" });
+  }
+}
+
+function formatPercent(value) {
+  if (value >= 99.5 && value < 100) {
+    return ">99 %";
+  }
+  if (value > 0 && value < 0.5) {
+    return "<1 %";
+  }
+  return `${Math.round(value)} %`;
+}
+
+function renderWinChance({ note = null } = {}) {
+  const panel = document.getElementById("win-chance");
+  const valueEl = document.getElementById("win-chance-value");
+  const fill = document.getElementById("win-chance-fill");
+  const deltaEl = document.getElementById("win-chance-delta");
+  const noteEl = document.getElementById("win-chance-note");
+  const chance = state.winChance;
+
+  panel.classList.toggle("loading", state.winChanceLoading);
+  panel.dataset.mode = chance ? chance.mode : "";
+  if (!chance || chance.percent === null) {
+    valueEl.textContent = "–";
+    fill.style.width = "0%";
+    deltaEl.textContent = "";
+    noteEl.textContent = note || (state.winChanceLoading ? "Räknar…" : "");
+    return;
+  }
+
+  const prefix = chance.mode === "unknown" ? "≈ " : "";
+  valueEl.textContent = prefix + formatPercent(chance.percent);
+  fill.style.width = `${Math.max(0, Math.min(100, chance.percent))}%`;
+
+  const delta = chance.delta;
+  if (delta === null || Math.abs(delta) < 0.5) {
+    deltaEl.textContent = delta === null ? "" : "±0";
+    deltaEl.className = "win-chance-delta";
+  } else {
+    deltaEl.textContent = `${delta > 0 ? "↑" : "↓"} ${Math.round(Math.abs(delta))}`;
+    deltaEl.className = `win-chance-delta ${delta > 0 ? "up" : "down"}`;
+  }
+
+  const notes = {
+    estimate: "Uppskattad chans att sökmotorn vinner om den spelar vidare härifrån. Kommande givar är okända.",
+    proven_win: `Bevisad vinst – det finns en vinstlinje på ${chance.lineLength} drag. Slutspelsanalysen visar den.`,
+    proven_loss: "Bevisligt förlorat – ingen dragföljd leder till vinst.",
+    unknown: "Slutspelet avgjordes inte inom tidsgränsen. Siffran är en uppskattning.",
+    won: "Partiet är vunnet.",
+  };
+  noteEl.textContent = note || (state.winChanceLoading ? "Räknar…" : notes[chance.mode] || "");
 }
 
 function setReachableError(error) {
@@ -796,6 +901,7 @@ function applySnapshot(snapshot) {
     state.celebratedGameId = null;
   }
   refreshReachable();
+  refreshWinChance();
   if (autoAiEnabled() && snapshot.status === "in_progress") {
     loadSuggestions({ silentIfCurrent: true }).catch((error) => {
       state.feedbackStatus = error.message;

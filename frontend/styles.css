@@ -786,3 +786,83 @@ button.danger {
   opacity: 0.65;
   font-weight: 700;
 }
+
+.win-chance {
+  margin-top: 1rem;
+  padding: 0.9rem 1.2rem;
+  background: var(--panel);
+  backdrop-filter: blur(8px);
+  border-radius: 24px;
+  box-shadow: var(--shadow);
+}
+
+.win-chance-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 1rem;
+}
+
+.win-chance-row {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-top: 0.3rem;
+}
+
+#win-chance-value {
+  font-size: 1.8rem;
+  min-width: 5.5ch;
+  font-variant-numeric: tabular-nums;
+  transition: opacity 0.2s;
+}
+
+.win-chance-meter {
+  flex: 1;
+  height: 10px;
+  border-radius: 999px;
+  background: rgba(23, 35, 29, 0.1);
+  overflow: hidden;
+}
+
+.win-chance-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 0.4s ease, background 0.2s;
+}
+
+.win-chance[data-mode="proven_loss"] .win-chance-fill {
+  background: var(--accent-2);
+}
+
+.win-chance[data-mode="proven_win"] #win-chance-value,
+.win-chance[data-mode="won"] #win-chance-value {
+  color: var(--accent);
+}
+
+.win-chance.loading #win-chance-value,
+.win-chance.loading .win-chance-meter {
+  opacity: 0.45;
+}
+
+.win-chance-delta {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+
+.win-chance-delta.up {
+  color: var(--accent);
+}
+
+.win-chance-delta.down {
+  color: var(--accent-2);
+}
+
+.win-chance-note {
+  margin-top: 0.35rem;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
