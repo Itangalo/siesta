@@ -789,19 +789,26 @@ class SolverConfig:
 def play_game(
     seed: Optional[int] = None,
     config: Optional[SolverConfig] = None,
+    deal: Optional[Tuple[Tableau, Tuple[int, ...]]] = None,
 ) -> Dict[str, object]:
-    """Play one full deal deterministically. Returns a result summary."""
+    """Play one full deal deterministically. Returns a result summary.
+
+    ``deal`` plays a given (cols, stock) instead of the seed's shuffle; the
+    seed then only drives the deal-preview sampling. ``actions`` in the result
+    lists every move as [from, to, run_length] and every deal as "deal"."""
     config = config or SolverConfig()
     started = time.time()
-    cols, stock = fast_deck_shuffle(seed)
+    cols, stock = deal if deal is not None else fast_deck_shuffle(seed)
     scorer = config.make_scorer()
     moves_played = 0
     deals_used = 0
+    actions: List[object] = []
 
     def apply_path(path: Sequence[MoveT]) -> None:
         nonlocal cols, moves_played
         for move in path:
             cols = apply_move(cols, move)
+            actions.append(list(move))
             moves_played += 1
 
     def finish() -> bool:
@@ -898,6 +905,7 @@ def play_game(
                 won = True
                 break
         cols, stock = apply_deal(cols, stock)
+        actions.append("deal")
         deals_used += 1
         if config.record_states:
             recorded_states.append((deals_used, cols))
@@ -913,6 +921,7 @@ def play_game(
         "completed_sequences": count_completed_sequences(cols),
         "moves_played": moves_played,
         "deals_used": deals_used,
+        "actions": actions,
         "entry": entry_tableau,
         "states": recorded_states if config.record_states else None,
         "seconds": round(elapsed, 3),

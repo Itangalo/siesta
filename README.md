@@ -52,3 +52,17 @@ python3 -m backend.siesta.winchance collect 2000 3000 states.pkl   # startseed, 
 python3 -m backend.siesta.winchance train states.pkl
 ```
 
+
+## Lösbarhet för spelade partier (ECHO 2026-10-11)
+
+`backend/data/engine_runs.jsonl` sparar varje motorkörning på dina avslutade partier (vunna eller uppgivna): `game_id`, resultat, seed, motorversion (git-commit, `-dirty` vid lokala ändringar), endgame-budget och – för vinster – hela draglistan, som spelats om och kontrollerats innan den sparas. Varje vinst, din eller motorns, bevisar alltså att given går att lösa. Filen är lokal och ignoreras av git, precis som sessionerna.
+
+```bash
+python3 -m backend.siesta.solvability run                        # partier utan känd lösning
+python3 -m backend.siesta.solvability run --all                  # alla avslutade partier, för att jämföra versioner
+python3 -m backend.siesta.solvability run --seed-offset 1 --endgame-time 90
+python3 -m backend.siesta.solvability report
+```
+
+Motorn är långt ifrån deterministisk: samma giv med annan seed vinns ofta inte igen. Att köra om olösta partier med ny `--seed-offset` hittar därför fler lösningar.
+
