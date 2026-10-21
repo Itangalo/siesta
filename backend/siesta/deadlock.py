@@ -10,8 +10,11 @@ A card of rank ``r`` is dead when
 1. all four cards of rank ``r + 1`` are already on the table (none left in the
    stock, so no fresh destination can be dealt), and
 2. every rank ``r + 1`` card is *blocked* – it carries, somewhere above it in
-   its column, either another rank ``r`` card or an already-known dead card,
-   and
+   its column, either another rank ``r`` card or an already-known dead card.
+   A rank ``r`` card that rests on its matching same-suit ``r + 1`` card does
+   not count: it leaves as part of a run led by a higher rank, so it vacates
+   without ever needing a rank ``r`` destination, and the circularity that
+   grounds the whole argument breaks. And
 3. the card itself is not resting directly on the matching same-suit ``r + 1``
    card, in which case it travels along as part of a colour run and never
    needs a destination of its own.
@@ -20,11 +23,15 @@ The analysis is deliberately conservative: a rank ``r + 1`` card buried under
 a card we cannot *prove* dead counts as unblocked. That keeps the result free
 of false positives, which is what makes it usable as a hard pruning signal.
 
-Deadness is monotone. Dealing only places cards on top of columns, so it can
-never unblock a rank ``r + 1`` card, and condition 1 rules out new ones
-arriving. Therefore a column holding a dead card cannot be emptied while no
-empty column exists – and if *every* column holds a dead card, no empty column
-can ever appear again, so the deal is provably lost.
+A dead card stays dead under dealing: dealing only places cards on top of
+columns, so it can never unblock a rank ``r + 1`` card, and condition 1 rules
+out new ones arriving. Moves are a different matter – lifting a run off a
+column can expose a card that was blocked before – so deadness is *not*
+monotone across moves, and a position may stop being flagged as it is played
+out. Within a single position the argument still holds: a column holding a
+dead card cannot be emptied while no empty column exists, and if *every*
+column holds a dead card, no empty column can ever appear again, so the deal
+is provably lost.
 """
 
 from __future__ import annotations
@@ -66,7 +73,11 @@ def _is_blocked(
     column = columns[column_index]
     for above_index in range(card_index + 1, len(column)):
         if column[above_index].rank == blocking_rank:
-            return True
+            # A blocker resting on its matching same-suit next-higher card
+            # travels with that run, led by a higher rank, so it can vacate
+            # without a destination of its own. It blocks nothing permanently.
+            if not _rests_on_matching_suit(columns, (column_index, above_index)):
+                return True
         if (column_index, above_index) in dead:
             return True
     return False

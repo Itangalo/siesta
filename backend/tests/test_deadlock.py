@@ -113,6 +113,45 @@ def test_deadness_never_argues_in_a_circle():
     assert 7 not in ranks, "and so the sevens must not be killed either"
 
 
+def test_a_run_borne_blocker_does_not_block():
+    # The eight of hearts is buried under the seven of clubs, but that seven
+    # rests on its own eight, so it leaves with the clubs run - lead eight,
+    # needing a nine - and exposes the eight of hearts. It is therefore no
+    # permanent blocker, and the seven of hearts is not dead.
+    columns = [
+        [card(8, "spades"), card(7, "hearts")],
+        [card(8, "hearts"), card(8, "clubs"), card(7, "clubs")],
+        [card(8, "diamonds"), card(7, "diamonds")],
+        [card(13, "hearts")],
+        [card(13, "diamonds")],
+        [card(13, "clubs")],
+        [card(13, "spades")],
+    ]
+    state = make_state(columns)
+    dead = dead_card_positions(state)
+    assert (0, 1) not in dead, "the seven of hearts can still reach the eight of hearts"
+
+
+def test_won_game_endgame_is_not_reported_as_lost():
+    # Move 80 of a real session that went on to be won. Every column holds a
+    # king or a seven the detector once called dead, so the whole deal was
+    # reported as provably lost. The clubs run in column 3 lifts off, exposing
+    # the eight of hearts for the hearts run in column 2.
+    columns = [
+        [card(11, "diamonds"), card(9, "diamonds"), card(1, "clubs"), card(4, "hearts"), card(9, "clubs"), card(2, "clubs")],
+        [card(8, "spades"), card(7, "hearts"), card(6, "hearts"), card(5, "hearts")],
+        [card(7, "spades"), card(8, "hearts"), card(10, "clubs"), card(12, "hearts"), card(11, "hearts"), card(10, "hearts"), card(9, "hearts"), card(8, "clubs"), card(7, "clubs"), card(6, "clubs"), card(5, "clubs"), card(4, "clubs"), card(3, "clubs")],
+        [card(3, "hearts"), card(2, "hearts"), card(1, "diamonds"), card(13, "hearts"), card(12, "clubs"), card(11, "clubs"), card(10, "diamonds")],
+        [card(6, "spades"), card(5, "spades"), card(4, "spades"), card(3, "spades"), card(2, "spades"), card(1, "spades")],
+        [card(13, "spades"), card(12, "spades"), card(13, "diamonds"), card(12, "diamonds"), card(11, "spades"), card(10, "spades"), card(9, "spades"), card(8, "diamonds"), card(7, "diamonds"), card(6, "diamonds"), card(5, "diamonds"), card(4, "diamonds"), card(3, "diamonds"), card(2, "diamonds"), card(1, "hearts")],
+        [card(13, "clubs")],
+    ]
+    state = make_state(columns)
+    dead = dead_card_positions(state)
+    assert not any(state.columns[c][i].rank == 7 for c, i in dead), "no seven is dead here"
+    assert not is_provably_lost(state)
+
+
 def test_not_lost_while_an_empty_column_exists():
     columns = [
         [card(7, "hearts"), card(6, "diamonds")],
