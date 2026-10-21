@@ -214,25 +214,33 @@ def _annotate_deadlock(snapshot: Dict[str, Any], state: GameState) -> Dict[str, 
     Kings are dead by definition and carry no information, so they are reported
     separately from the ranks that were *derived* dead - those are the ones that
     say something about how the position is going.
+
+    Derived deadness assumes no hole is available to absorb a blocker, so it is
+    only shown while every column is occupied. With a hole on the table the
+    blocker above a destination can be parked in it, which exposes that
+    destination and revives the card - so marking it dead would be a lie the
+    player can disprove in one move. Kings stay marked either way: no rank 14
+    exists, so a hole is the only place a king can ever go.
     """
 
     dead = dead_card_positions(state)
-    per_column: Dict[int, List[int]] = {}
-    for column_index, card_index in dead:
-        per_column.setdefault(column_index, []).append(card_index)
+    has_hole = any(not column for column in state.columns)
+    marked = 0
 
-    for column_index, card_indices in per_column.items():
-        for card_index in card_indices:
-            is_king = state.columns[column_index][card_index].rank == 13
-            card = snapshot["columns"][column_index]["cards"][card_index]
-            card["dead"] = True
-            # Kings are dead by definition rather than derived, but they are
-            # marked too: it makes the marking verifiable by eye.
-            card["dead_by_rule"] = not is_king
-            card["dead_marked"] = True
+    for column_index, card_index in dead:
+        is_king = state.columns[column_index][card_index].rank == 13
+        if has_hole and not is_king:
+            continue
+        card = snapshot["columns"][column_index]["cards"][card_index]
+        card["dead"] = True
+        # Kings are dead by definition rather than derived, but they are
+        # marked too: it makes the marking verifiable by eye.
+        card["dead_by_rule"] = not is_king
+        card["dead_marked"] = True
+        marked += 1
 
     snapshot["provably_lost"] = is_provably_lost(state)
-    snapshot["dead_card_count"] = len(dead)
+    snapshot["dead_card_count"] = marked
     return snapshot
 
 

@@ -160,11 +160,15 @@ def is_won(cols: Tableau) -> bool:
 
 
 def dead_columns(cols: Tableau, stock_rank_counts: Optional[Dict[int, int]] = None) -> List[bool]:
-    """Port of deadlock.locked_column_flags.
+    """Port of deadlock.locked_column_flags - keep the two in step.
 
     Returns per-column flags: True when the column holds at least one dead
     card. Uses only the *count* of each rank left in the stock, never their
     order, so it stays fair for a player who cannot see future deals.
+
+    See deadlock.py for the argument. The derived ranks assume no hole is
+    available; ``all(dead_columns(...))`` implies that by itself, since an
+    empty column holds no dead card and so never sets its flag.
     """
     counts: Dict[int, int] = dict(stock_rank_counts or {})
     positions_by_rank: Dict[int, List[Tuple[int, int]]] = {}
@@ -186,7 +190,11 @@ def dead_columns(cols: Tableau, stock_rank_counts: Optional[Dict[int, int]] = No
         col = cols[ci]
         for j in range(i + 1, len(col)):
             if RANK[col[j]] == blocking_rank:
-                return True
+                # A blocker resting on its matching same-suit next-higher card
+                # travels with that run, led by a higher rank, so it vacates
+                # without a destination of its own and blocks nothing.
+                if not rests_on_matching((ci, j)):
+                    return True
             if (ci, j) in dead:
                 return True
         return False

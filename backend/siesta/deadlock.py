@@ -84,7 +84,18 @@ def _is_blocked(
 
 
 def dead_card_positions(state: GameState) -> Set[CardPosition]:
-    """Return the positions of every card that can only move into a hole."""
+    """Return the positions of every card that can only move into a hole.
+
+    Precondition for the *derived* ranks: no hole is available. A blocker can
+    be parked in a hole, which exposes the destination underneath it and
+    revives the card that was resting on the deduction. Callers that present
+    the result as a fact about the position must therefore check for holes
+    first; ``is_provably_lost`` does. Kings need no precondition - no rank 14
+    exists, so a hole is the only destination they can ever have.
+
+    ``fastgame.dead_columns`` is a port of this analysis. The two must agree;
+    ``test_deadlock.py`` pins that.
+    """
 
     columns = state.columns
     positions = _positions_by_rank(columns)
@@ -127,7 +138,12 @@ def locked_column_flags(state: GameState) -> List[bool]:
 
 
 def emptiable_column_count(state: GameState) -> int:
-    """Columns that are empty already or hold no dead card."""
+    """Columns that are empty already or hold no dead card.
+
+    Carries the same no-hole precondition as ``dead_card_positions``: with a
+    hole on the table a locked column can be unloaded into it, so the count is
+    a lower bound rather than a fact.
+    """
 
     flags = locked_column_flags(state)
     return sum(1 for column_index, column in enumerate(state.columns) if not column or not flags[column_index])
