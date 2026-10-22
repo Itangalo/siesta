@@ -1,10 +1,13 @@
+import random
+
+from backend.siesta import fastgame
 from backend.siesta.deadlock import (
     dead_card_positions,
     emptiable_column_count,
     is_provably_lost,
     locked_column_flags,
 )
-from backend.siesta.game import Card, GameState, create_deck
+from backend.siesta.game import Card, GameState, apply_deal, apply_move, create_deck, create_game, legal_moves
 
 
 SUITS = ["hearts", "diamonds", "clubs", "spades"]
@@ -113,6 +116,50 @@ def test_deadness_never_argues_in_a_circle():
     assert 7 not in ranks, "and so the sevens must not be killed either"
 
 
+def test_a_run_borne_blocker_does_not_block():
+    # The eight of hearts is buried under the seven of clubs, but that seven
+    # rests on its own eight, so it leaves with the clubs run - lead eight,
+    # needing a nine - and exposes the eight of hearts. It is therefore no
+    # permanent blocker, and the seven of hearts is not dead.
+    columns = [
+        [card(8, "spades"), card(7, "hearts")],
+        [card(8, "hearts"), card(8, "clubs"), card(7, "clubs")],
+        [card(8, "diamonds"), card(7, "diamonds")],
+        [card(13, "hearts")],
+        [card(13, "diamonds")],
+        [card(13, "clubs")],
+        [card(13, "spades")],
+    ]
+    state = make_state(columns)
+    dead = dead_card_positions(state)
+    assert (0, 1) not in dead, "the seven of hearts can still reach the eight of hearts"
+
+
+def won_game_move_80():
+    """Move 80 of a real session that went on to be won.
+
+    Every column holds a king or a seven the detector once called dead, so the
+    whole deal was reported as provably lost. The clubs run in column 3 lifts
+    off, exposing the eight of hearts for the hearts run in column 2.
+    """
+    return [
+        [card(11, "diamonds"), card(9, "diamonds"), card(1, "clubs"), card(4, "hearts"), card(9, "clubs"), card(2, "clubs")],
+        [card(8, "spades"), card(7, "hearts"), card(6, "hearts"), card(5, "hearts")],
+        [card(7, "spades"), card(8, "hearts"), card(10, "clubs"), card(12, "hearts"), card(11, "hearts"), card(10, "hearts"), card(9, "hearts"), card(8, "clubs"), card(7, "clubs"), card(6, "clubs"), card(5, "clubs"), card(4, "clubs"), card(3, "clubs")],
+        [card(3, "hearts"), card(2, "hearts"), card(1, "diamonds"), card(13, "hearts"), card(12, "clubs"), card(11, "clubs"), card(10, "diamonds")],
+        [card(6, "spades"), card(5, "spades"), card(4, "spades"), card(3, "spades"), card(2, "spades"), card(1, "spades")],
+        [card(13, "spades"), card(12, "spades"), card(13, "diamonds"), card(12, "diamonds"), card(11, "spades"), card(10, "spades"), card(9, "spades"), card(8, "diamonds"), card(7, "diamonds"), card(6, "diamonds"), card(5, "diamonds"), card(4, "diamonds"), card(3, "diamonds"), card(2, "diamonds"), card(1, "hearts")],
+        [card(13, "clubs")],
+    ]
+
+
+def test_won_game_endgame_is_not_reported_as_lost():
+    state = make_state(won_game_move_80())
+    dead = dead_card_positions(state)
+    assert not any(state.columns[c][i].rank == 7 for c, i in dead), "no seven is dead here"
+    assert not is_provably_lost(state)
+
+
 def test_not_lost_while_an_empty_column_exists():
     columns = [
         [card(7, "hearts"), card(6, "diamonds")],
@@ -149,6 +196,41 @@ def test_a_won_layout_is_never_reported_as_lost():
     ] + [[], [], []]
     state = make_state(columns)
     assert not is_provably_lost(state)
+
+
+def assert_port_agrees(state):
+    cols, _ = fastgame.game_state_to_fast(state.columns, state.stock)
+    stock_counts = {}
+    for c in state.stock:
+        stock_counts[c.rank] = stock_counts.get(c.rank, 0) + 1
+    assert fastgame.dead_columns(cols, stock_counts) == locked_column_flags(state), (
+        f"port disagrees on dead columns:\n{fastgame.describe_tableau(cols)}"
+    )
+    assert fastgame.is_provably_lost(cols, stock_counts) == is_provably_lost(state), (
+        f"port disagrees on the verdict:\n{fastgame.describe_tableau(cols)}"
+    )
+
+
+def test_fastgame_port_agrees_on_the_discriminating_position():
+    # The two implementations drifted once and the same unsound blocker rule
+    # survived in both, so parity has to be pinned on a position where the
+    # rule actually bites - a random walk rarely reaches one.
+    assert_port_agrees(make_state(won_game_move_80()))
+
+
+def test_fastgame_port_agrees_along_random_play():
+    for seed in range(8):
+        rng = random.Random(seed)
+        state = create_game(seed=seed)
+        for _ in range(120):
+            assert_port_agrees(state)
+            moves = legal_moves(state)
+            if moves and (not state.stock or rng.random() < 0.85):
+                state = apply_move(state, rng.choice(moves))
+            elif state.stock:
+                state = apply_deal(state)
+            else:
+                break
 
 
 def test_full_deck_on_the_table_is_analysable():

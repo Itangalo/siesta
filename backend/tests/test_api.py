@@ -334,3 +334,45 @@ def test_win_chance_endgame_proven_loss():
 
 def test_win_chance_unknown_game_is_404():
     assert client.get("/ai/win-chance", params={"game_id": "does-not-exist"}).status_code == 404
+
+
+def test_derived_dead_cards_are_only_marked_without_a_hole():
+    from backend.siesta.game import Card
+
+    # Every seven carries a six of a different suit, so no six can reach a
+    # seven and all four are dead - as long as no hole exists.
+    columns = [
+        [Card(7, "hearts"), Card(6, "diamonds")],
+        [Card(7, "diamonds"), Card(6, "clubs")],
+        [Card(7, "clubs"), Card(6, "spades")],
+        [Card(7, "spades"), Card(6, "hearts")],
+        [Card(13, "hearts")],
+        [Card(13, "diamonds")],
+        [Card(13, "clubs")],
+    ]
+    session = _session_with(columns)
+    data = client.get("/game/state", params={"game_id": session.game_id}).json()
+    marked = [
+        card["code"]
+        for column in data["columns"]
+        for card in column["cards"]
+        if card.get("dead_marked")
+    ]
+    assert sorted(marked) == ["6C", "6D", "6H", "6S", "KC", "KD", "KH"]
+
+    # Open a hole by emptying the last king column. The six on top of a seven
+    # can now be parked in it, exposing that seven, so no six is dead any
+    # more - only the kings, which can never land on anything.
+    holed = [list(column) for column in columns]
+    holed[6] = []
+    session = _session_with(holed)
+    data = client.get("/game/state", params={"game_id": session.game_id}).json()
+    marked = [
+        card["code"]
+        for column in data["columns"]
+        for card in column["cards"]
+        if card.get("dead_marked")
+    ]
+    assert sorted(marked) == ["KD", "KH"]
+    assert data["dead_card_count"] == 2
+    assert data["provably_lost"] is False

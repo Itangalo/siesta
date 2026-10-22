@@ -10,8 +10,11 @@ A card of rank ``r`` is dead when
 1. all four cards of rank ``r + 1`` are already on the table (none left in the
    stock, so no fresh destination can be dealt), and
 2. every rank ``r + 1`` card is *blocked* – it carries, somewhere above it in
-   its column, either another rank ``r`` card or an already-known dead card,
-   and
+   its column, either another rank ``r`` card or an already-known dead card.
+   A rank ``r`` card that rests on its matching same-suit ``r + 1`` card does
+   not count: it leaves as part of a run led by a higher rank, so it vacates
+   without ever needing a rank ``r`` destination, and the circularity that
+   grounds the whole argument breaks. And
 3. the card itself is not resting directly on the matching same-suit ``r + 1``
    card, in which case it travels along as part of a colour run and never
    needs a destination of its own.
@@ -20,11 +23,15 @@ The analysis is deliberately conservative: a rank ``r + 1`` card buried under
 a card we cannot *prove* dead counts as unblocked. That keeps the result free
 of false positives, which is what makes it usable as a hard pruning signal.
 
-Deadness is monotone. Dealing only places cards on top of columns, so it can
-never unblock a rank ``r + 1`` card, and condition 1 rules out new ones
-arriving. Therefore a column holding a dead card cannot be emptied while no
-empty column exists – and if *every* column holds a dead card, no empty column
-can ever appear again, so the deal is provably lost.
+A dead card stays dead under dealing: dealing only places cards on top of
+columns, so it can never unblock a rank ``r + 1`` card, and condition 1 rules
+out new ones arriving. Moves are a different matter – lifting a run off a
+column can expose a card that was blocked before – so deadness is *not*
+monotone across moves, and a position may stop being flagged as it is played
+out. Within a single position the argument still holds: a column holding a
+dead card cannot be emptied while no empty column exists, and if *every*
+column holds a dead card, no empty column can ever appear again, so the deal
+is provably lost.
 """
 
 from __future__ import annotations
@@ -66,14 +73,29 @@ def _is_blocked(
     column = columns[column_index]
     for above_index in range(card_index + 1, len(column)):
         if column[above_index].rank == blocking_rank:
-            return True
+            # A blocker resting on its matching same-suit next-higher card
+            # travels with that run, led by a higher rank, so it can vacate
+            # without a destination of its own. It blocks nothing permanently.
+            if not _rests_on_matching_suit(columns, (column_index, above_index)):
+                return True
         if (column_index, above_index) in dead:
             return True
     return False
 
 
 def dead_card_positions(state: GameState) -> Set[CardPosition]:
-    """Return the positions of every card that can only move into a hole."""
+    """Return the positions of every card that can only move into a hole.
+
+    Precondition for the *derived* ranks: no hole is available. A blocker can
+    be parked in a hole, which exposes the destination underneath it and
+    revives the card that was resting on the deduction. Callers that present
+    the result as a fact about the position must therefore check for holes
+    first; ``is_provably_lost`` does. Kings need no precondition - no rank 14
+    exists, so a hole is the only destination they can ever have.
+
+    ``fastgame.dead_columns`` is a port of this analysis. The two must agree;
+    ``test_deadlock.py`` pins that.
+    """
 
     columns = state.columns
     positions = _positions_by_rank(columns)
@@ -116,7 +138,12 @@ def locked_column_flags(state: GameState) -> List[bool]:
 
 
 def emptiable_column_count(state: GameState) -> int:
-    """Columns that are empty already or hold no dead card."""
+    """Columns that are empty already or hold no dead card.
+
+    Carries the same no-hole precondition as ``dead_card_positions``: with a
+    hole on the table a locked column can be unloaded into it, so the count is
+    a lower bound rather than a fact.
+    """
 
     flags = locked_column_flags(state)
     return sum(1 for column_index, column in enumerate(state.columns) if not column or not flags[column_index])
